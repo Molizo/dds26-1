@@ -51,3 +51,11 @@ but you can find any database you want in https://artifacthub.io/ and adapt the 
 Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in the helm step to also install an ingress to the cluster. 
 
 ***Requirements:*** You need to have access to kubectl of a k8s cluster.
+
+### Phase 3 migration note (2026-02-16)
+
+- Stock and payment persistence migrated from msgpack blobs (`<id>`) to Redis hashes:
+  - `stock:<item_id>`
+  - `payment:<user_id>`
+- During migration from older runtime states, existing stock/payment data is not read-compatible.
+- If upgrading an existing environment, clear stock/payment Redis data and re-seed via the existing create/batch-init endpoints before running tests.

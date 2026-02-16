@@ -5,8 +5,15 @@ import uuid
 
 import redis
 
-from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response
+from flask import Flask, jsonify, abort, Response, request
+
+from shared_messaging.redis_atomic import (
+    ATOMIC_BUSINESS_REJECT,
+    ATOMIC_MISSING_ENTITY,
+    release_stock_atomic,
+    reserve_stock_atomic,
+)
+from shared_messaging.redis_keys import stock_hash_key
 
 
 DB_ERROR_STR = "DB error"
@@ -16,7 +23,8 @@ app = Flask("stock-service")
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+                              db=int(os.environ['REDIS_DB']),
+                              decode_responses=True)
 
 
 def close_db_connection():
@@ -26,32 +34,34 @@ def close_db_connection():
 atexit.register(close_db_connection)
 
 
-class StockValue(Struct):
-    stock: int
-    price: int
-
-
-def get_item_from_db(item_id: str) -> StockValue | None:
-    # get serialized data
+def get_item_from_db(item_id: str) -> dict[str, int]:
     try:
-        entry: bytes = db.get(item_id)
+        entry = db.hgetall(stock_hash_key(item_id))
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
-    entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
-    if entry is None:
-        # if item does not exist in the database; abort
+    if not entry:
         abort(400, f"Item: {item_id} not found!")
-    return entry
+    try:
+        stock = int(entry["stock"])
+        price = int(entry["price"])
+    except (KeyError, ValueError, TypeError):
+        abort(400, f"Item: {item_id} not found!")
+    return {"stock": stock, "price": price}
+
+
+def resolve_message_id(default_scope: str) -> str:
+    idempotency_key = request.headers.get("X-Idempotency-Key")
+    if idempotency_key:
+        return f"{default_scope}:{idempotency_key}"
+    return f"{default_scope}:{uuid.uuid4()}"
 
 
 @app.post('/item/create/<price>')
 def create_item(price: int):
     key = str(uuid.uuid4())
     app.logger.debug(f"Item: {key} created")
-    value = msgpack.encode(StockValue(stock=0, price=int(price)))
     try:
-        db.set(key, value)
+        db.hset(stock_hash_key(key), mapping={"stock": 0, "price": int(price)})
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({'item_id': key})
@@ -62,10 +72,11 @@ def batch_init_users(n: int, starting_stock: int, item_price: int):
     n = int(n)
     starting_stock = int(starting_stock)
     item_price = int(item_price)
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
-                                  for i in range(n)}
     try:
-        db.mset(kv_pairs)
+        with db.pipeline() as pipe:
+            for i in range(n):
+                pipe.hset(stock_hash_key(f"{i}"), mapping={"stock": starting_stock, "price": item_price})
+            pipe.execute()
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for stock successful"})
@@ -73,40 +84,63 @@ def batch_init_users(n: int, starting_stock: int, item_price: int):
 
 @app.get('/find/<item_id>')
 def find_item(item_id: str):
-    item_entry: StockValue = get_item_from_db(item_id)
+    item_entry = get_item_from_db(item_id)
     return jsonify(
         {
-            "stock": item_entry.stock,
-            "price": item_entry.price
+            "stock": item_entry["stock"],
+            "price": item_entry["price"]
         }
     )
 
 
 @app.post('/add/<item_id>/<amount>')
 def add_stock(item_id: str, amount: int):
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
-    item_entry.stock += int(amount)
+    amount = int(amount)
+    message_id = resolve_message_id(f"rest-stock-add:{item_id}:{amount}")
     try:
-        db.set(item_id, msgpack.encode(item_entry))
+        result = release_stock_atomic(
+            db,
+            service="stock-rest",
+            message_id=message_id,
+            item_id=item_id,
+            step="rest_add",
+            quantity=amount,
+        )
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
+    if result.status == ATOMIC_MISSING_ENTITY:
+        abort(400, f"Item: {item_id} not found!")
+    if result.status == ATOMIC_BUSINESS_REJECT:
+        abort(400, f"Item: {item_id} stock add amount is invalid!")
+
+    item_entry = get_item_from_db(item_id)
+    return Response(f"Item: {item_id} stock updated to: {item_entry['stock']}", status=200)
 
 
 @app.post('/subtract/<item_id>/<amount>')
 def remove_stock(item_id: str, amount: int):
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
-    item_entry.stock -= int(amount)
-    app.logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
-    if item_entry.stock < 0:
-        abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
+    amount = int(amount)
+    message_id = resolve_message_id(f"rest-stock-subtract:{item_id}:{amount}")
     try:
-        db.set(item_id, msgpack.encode(item_entry))
+        result = reserve_stock_atomic(
+            db,
+            service="stock-rest",
+            message_id=message_id,
+            item_id=item_id,
+            step="rest_subtract",
+            quantity=amount,
+        )
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
+
+    if result.status == ATOMIC_MISSING_ENTITY:
+        abort(400, f"Item: {item_id} not found!")
+    if result.status == ATOMIC_BUSINESS_REJECT:
+        abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
+
+    item_entry = get_item_from_db(item_id)
+    app.logger.debug(f"Item: {item_id} stock updated to: {item_entry['stock']}")
+    return Response(f"Item: {item_id} stock updated to: {item_entry['stock']}", status=200)
 
 
 if __name__ == '__main__':

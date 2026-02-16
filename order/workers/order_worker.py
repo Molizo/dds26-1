@@ -4,25 +4,57 @@ import sys
 from pathlib import Path
 
 import pika
+import redis
 
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
 if str(SERVICE_ROOT) not in sys.path:
     sys.path.append(str(SERVICE_ROOT))
 
 from messaging import build_rabbitmq_parameters, decide_message_action, get_message_logger
+from shared_messaging.idempotency import PROCESS_ACTION_RETRY, process_idempotent_step
+from shared_messaging.redis_atomic import ATOMIC_APPLIED, ATOMIC_DUPLICATE, AtomicResult
+from shared_messaging.redis_keys import EFFECT_TTL_SEC, INBOX_TTL_SEC, effect_key, inbox_key
 
 LOGGER = logging.getLogger("order-worker")
+db: redis.Redis = redis.Redis(
+    host=os.environ["REDIS_HOST"],
+    port=int(os.environ["REDIS_PORT"]),
+    password=os.environ["REDIS_PASSWORD"],
+    db=int(os.environ["REDIS_DB"]),
+    decode_responses=True,
+)
+
+
+def mark_order_message_processed(message_id: str, order_id: str, step: str) -> AtomicResult:
+    marker_key = inbox_key("order-worker", message_id)
+    applied = db.set(marker_key, "1", ex=INBOX_TTL_SEC, nx=True)
+    if not applied:
+        return AtomicResult(status=ATOMIC_DUPLICATE, raw_code=0)
+    db.set(effect_key("order-worker", order_id, step), "1", ex=EFFECT_TTL_SEC)
+    return AtomicResult(status=ATOMIC_APPLIED, raw_code=1)
 
 
 def process_delivery(body: bytes) -> str:
     decision = decide_message_action(body)
-    if decision.action == "ack" and decision.message is not None:
-        message_logger = get_message_logger(LOGGER, decision.message.metadata)
-        message_logger.info("Validated message type=%s", decision.message.message_type)
-        return "ack"
+    if decision.action != "ack" or decision.message is None:
+        LOGGER.warning("Rejected message: %s", decision.reason)
+        return "reject"
 
-    LOGGER.warning("Rejected message: %s", decision.reason)
-    return "reject"
+    message = decision.message
+    message_logger = get_message_logger(LOGGER, message.metadata)
+    message_logger.info("Validated message type=%s", message.message_type)
+
+    outcome = process_idempotent_step(
+        apply_effect=lambda: mark_order_message_processed(
+            message.metadata.message_id,
+            message.metadata.order_id,
+            f"{message.metadata.step}:{message.message_type}",
+        )
+    )
+    if outcome.action == PROCESS_ACTION_RETRY:
+        message_logger.warning("Retrying message due to infra error: %s", outcome.reason)
+        return "retry"
+    return "ack"
 
 
 def on_message(channel, method, properties, body):
@@ -30,6 +62,8 @@ def on_message(channel, method, properties, body):
     action = process_delivery(body)
     if action == "ack":
         channel.basic_ack(delivery_tag=method.delivery_tag)
+    elif action == "retry":
+        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
     else:
         channel.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
 

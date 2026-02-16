@@ -4,25 +4,68 @@ import sys
 from pathlib import Path
 
 import pika
+import redis
 
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
 if str(SERVICE_ROOT) not in sys.path:
     sys.path.append(str(SERVICE_ROOT))
 
 from messaging import build_rabbitmq_parameters, decide_message_action, get_message_logger
+from shared_messaging.contracts import ChargePaymentPayload
+from shared_messaging.idempotency import PROCESS_ACTION_RETRY, process_idempotent_step
+from shared_messaging.redis_atomic import charge_payment_atomic
 
 LOGGER = logging.getLogger("payment-worker")
+db: redis.Redis = redis.Redis(
+    host=os.environ["REDIS_HOST"],
+    port=int(os.environ["REDIS_PORT"]),
+    password=os.environ["REDIS_PASSWORD"],
+    db=int(os.environ["REDIS_DB"]),
+    decode_responses=True,
+)
 
 
 def process_delivery(body: bytes) -> str:
     decision = decide_message_action(body)
-    if decision.action == "ack" and decision.message is not None:
-        message_logger = get_message_logger(LOGGER, decision.message.metadata)
-        message_logger.info("Validated message type=%s", decision.message.message_type)
-        return "ack"
+    if decision.action != "ack" or decision.message is None:
+        LOGGER.warning("Rejected message: %s", decision.reason)
+        return "reject"
 
-    LOGGER.warning("Rejected message: %s", decision.reason)
-    return "reject"
+    message = decision.message
+    message_logger = get_message_logger(LOGGER, message.metadata)
+    message_logger.info("Validated message type=%s", message.message_type)
+
+    if message.message_type != "ChargePayment":
+        message_logger.warning("Unsupported payment worker message type=%s", message.message_type)
+        return "reject"
+
+    payload = message.payload
+    if not isinstance(payload, ChargePaymentPayload):
+        message_logger.warning("Invalid payload type for ChargePayment")
+        return "reject"
+    outcome = process_idempotent_step(
+        apply_effect=lambda: charge_payment_atomic(
+            db,
+            service="payment-worker",
+            message_id=message.metadata.message_id,
+            user_id=payload.user_id,
+            step=f"{message.metadata.step}:charge",
+            amount=payload.amount,
+        )
+    )
+
+    if outcome.action == PROCESS_ACTION_RETRY:
+        message_logger.warning("Retrying ChargePayment due to infra error: %s", outcome.reason)
+        return "retry"
+
+    if outcome.status == "business_reject":
+        message_logger.info(
+            "ChargePayment business rejection for order=%s user=%s reason=%s",
+            message.metadata.order_id,
+            payload.user_id,
+            outcome.reason,
+        )
+    return "ack"
 
 
 def on_message(channel, method, properties, body):
@@ -30,6 +73,8 @@ def on_message(channel, method, properties, body):
     action = process_delivery(body)
     if action == "ack":
         channel.basic_ack(delivery_tag=method.delivery_tag)
+    elif action == "retry":
+        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
     else:
         channel.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
 

@@ -1,0 +1,25 @@
+auth:
+  password: redis
+
+master:
+  persistence:
+    size: 4Gi
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 250m
+    limits:
+      memory: 512Mi
+      cpu: 500m
+
+replica:
+  replicaCount: 0
+  persistence:
+    size: 4Gi
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 250m
+    limits:
+      memory: 512Mi
+      cpu: 500m

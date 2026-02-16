@@ -1,0 +1,356 @@
+{
+  "vhosts": [
+    {
+      "name": "/"
+    }
+  ],
+  "users": [
+    {
+      "name": "dds",
+      "password": "dds-rabbit",
+      "tags": "administrator"
+    }
+  ],
+  "permissions": [
+    {
+      "user": "dds",
+      "vhost": "/",
+      "configure": ".*",
+      "write": ".*",
+      "read": ".*"
+    }
+  ],
+  "parameters": [],
+  "policies": [],
+  "queues": [
+    {
+      "name": "checkout.command.q",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "checkout.retry",
+        "x-dead-letter-routing-key": "checkout.retry"
+      }
+    },
+    {
+      "name": "checkout.command.retry.q",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-message-ttl": 5000,
+        "x-dead-letter-exchange": "checkout.command",
+        "x-dead-letter-routing-key": "checkout.command"
+      }
+    },
+    {
+      "name": "checkout.command.dlq",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    },
+    {
+      "name": "stock.command.q",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "stock.retry",
+        "x-dead-letter-routing-key": "stock.retry"
+      }
+    },
+    {
+      "name": "stock.command.retry.q",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-message-ttl": 5000,
+        "x-dead-letter-exchange": "stock.command",
+        "x-dead-letter-routing-key": "stock.command"
+      }
+    },
+    {
+      "name": "stock.command.dlq",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    },
+    {
+      "name": "payment.command.q",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "payment.retry",
+        "x-dead-letter-routing-key": "payment.retry"
+      }
+    },
+    {
+      "name": "payment.command.retry.q",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-message-ttl": 5000,
+        "x-dead-letter-exchange": "payment.command",
+        "x-dead-letter-routing-key": "payment.command"
+      }
+    },
+    {
+      "name": "payment.command.dlq",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    },
+    {
+      "name": "order.command.q",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "order.retry",
+        "x-dead-letter-routing-key": "order.retry"
+      }
+    },
+    {
+      "name": "order.command.retry.q",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-message-ttl": 5000,
+        "x-dead-letter-exchange": "order.command",
+        "x-dead-letter-routing-key": "order.command"
+      }
+    },
+    {
+      "name": "order.command.dlq",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    }
+  ],
+  "exchanges": [
+    {
+      "name": "checkout.command",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "checkout.retry",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "checkout.dlx",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "stock.command",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "stock.retry",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "stock.dlx",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "payment.command",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "payment.retry",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "payment.dlx",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "order.command",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "order.retry",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "order.dlx",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "checkout.events",
+      "vhost": "/",
+      "type": "topic",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    }
+  ],
+  "bindings": [
+    {
+      "source": "checkout.command",
+      "vhost": "/",
+      "destination": "checkout.command.q",
+      "destination_type": "queue",
+      "routing_key": "checkout.command",
+      "arguments": {}
+    },
+    {
+      "source": "checkout.retry",
+      "vhost": "/",
+      "destination": "checkout.command.retry.q",
+      "destination_type": "queue",
+      "routing_key": "checkout.retry",
+      "arguments": {}
+    },
+    {
+      "source": "checkout.dlx",
+      "vhost": "/",
+      "destination": "checkout.command.dlq",
+      "destination_type": "queue",
+      "routing_key": "checkout.dlq",
+      "arguments": {}
+    },
+    {
+      "source": "stock.command",
+      "vhost": "/",
+      "destination": "stock.command.q",
+      "destination_type": "queue",
+      "routing_key": "stock.command",
+      "arguments": {}
+    },
+    {
+      "source": "stock.retry",
+      "vhost": "/",
+      "destination": "stock.command.retry.q",
+      "destination_type": "queue",
+      "routing_key": "stock.retry",
+      "arguments": {}
+    },
+    {
+      "source": "stock.dlx",
+      "vhost": "/",
+      "destination": "stock.command.dlq",
+      "destination_type": "queue",
+      "routing_key": "stock.dlq",
+      "arguments": {}
+    },
+    {
+      "source": "payment.command",
+      "vhost": "/",
+      "destination": "payment.command.q",
+      "destination_type": "queue",
+      "routing_key": "payment.command",
+      "arguments": {}
+    },
+    {
+      "source": "payment.retry",
+      "vhost": "/",
+      "destination": "payment.command.retry.q",
+      "destination_type": "queue",
+      "routing_key": "payment.retry",
+      "arguments": {}
+    },
+    {
+      "source": "payment.dlx",
+      "vhost": "/",
+      "destination": "payment.command.dlq",
+      "destination_type": "queue",
+      "routing_key": "payment.dlq",
+      "arguments": {}
+    },
+    {
+      "source": "order.command",
+      "vhost": "/",
+      "destination": "order.command.q",
+      "destination_type": "queue",
+      "routing_key": "order.command",
+      "arguments": {}
+    },
+    {
+      "source": "order.retry",
+      "vhost": "/",
+      "destination": "order.command.retry.q",
+      "destination_type": "queue",
+      "routing_key": "order.retry",
+      "arguments": {}
+    },
+    {
+      "source": "order.dlx",
+      "vhost": "/",
+      "destination": "order.command.dlq",
+      "destination_type": "queue",
+      "routing_key": "order.dlq",
+      "arguments": {}
+    }
+  ]
+}

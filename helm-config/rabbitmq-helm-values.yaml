@@ -1,0 +1,41 @@
+image:
+  repository: bitnamilegacy/rabbitmq
+
+global:
+  security:
+    allowInsecureImages: true
+
+auth:
+  username: dds
+  password: dds-rabbit
+  securePassword: false
+  erlangCookie: dds-rabbit-cookie
+
+replicaCount: 1
+
+persistence:
+  enabled: true
+  size: 8Gi
+
+resources:
+  requests:
+    memory: 512Mi
+    cpu: 250m
+  limits:
+    memory: 1Gi
+    cpu: 1000m
+
+metrics:
+  enabled: true
+
+loadDefinition:
+  enabled: true
+  existingSecret: rabbitmq-load-definition
+  file: /app/load_definition.json
+
+extraConfiguration: |-
+  default_vhost = /
+  default_permissions.configure = .*
+  default_permissions.read = .*
+  default_permissions.write = .*
+  load_definitions = /app/load_definition.json

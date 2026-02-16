@@ -134,6 +134,7 @@ Expected temporary state:
 Expected temporary state:
 1. App still uses old checkout path.
 2. Broker exists but may be unused initially.
+3. Worker templates are deployed with `replicas: 1` and can crashloop until Phase 4 consumer runtime is implemented.
 
 ### Phase 2: Internal Contracts and Libraries
 1. Add shared message serialization/parsing module used by all services.
@@ -295,5 +296,7 @@ Use this protocol whenever unexpected issues arise or implementation opinion cha
 4. Prefer minimal safe deltas to get back to a working migration path.
 
 ## Plan Change Log
-1. 2026-02-16: Phase 0 implementation started. Added `plans/Phase_0_Contract_Freeze.md` as the single appendix artifact; froze checkout bounded-wait timeout behavior to return `400` to preserve synchronous failure semantics.
-2. 2026-02-16: Added explicit replanning protocol and change-log requirements for handling unexpected issues and design-opinion changes.
+1. 2026-02-16: Phase 1 infrastructure implemented: added RabbitMQ Helm values, startup topology definitions (durable command/retry/DLQ exchanges and queues), chart deployment wiring in both chart scripts, and worker deployment templates for order/stock/payment with `replicas: 1`.
+2. 2026-02-16: Phase 0 implementation started. Added `plans/Phase_0_Contract_Freeze.md` as the single appendix artifact; froze checkout bounded-wait timeout behavior to return `400` to preserve synchronous failure semantics.
+3. 2026-02-16: Added explicit replanning protocol and change-log requirements for handling unexpected issues and design-opinion changes.
+4. 2026-02-16: Phase 1 deployment blocked in minikube by two issues: `bitnami/rabbitmq` tags unavailable on Docker Hub free tier and Redis requests too large for local cluster capacity. Decision: pin RabbitMQ image repository to `bitnamilegacy/rabbitmq`, set `global.security.allowInsecureImages=true` for chart image verification guardrails, and add `helm-config/redis-helm-values-minikube.yaml` with reduced resources and no replicas for local deployment stability.

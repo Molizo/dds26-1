@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-worker-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      component: payment-worker
+      role: worker
+  template:
+    metadata:
+      labels:
+        component: payment-worker
+        role: worker
+    spec:
+      containers:
+        - name: payment-worker
+          image: user:latest
+          resources:
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+          command: ["python"]
+          args: ["workers/payment_worker.py"]
+          env:
+            - name: REDIS_HOST
+              value: redis-master
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_PASSWORD
+              value: "redis"
+            - name: REDIS_DB
+              value: "0"
+            - name: RABBITMQ_HOST
+              value: rabbitmq
+            - name: RABBITMQ_PORT
+              value: "5672"
+            - name: RABBITMQ_USER
+              value: "dds"
+            - name: RABBITMQ_PASSWORD
+              value: "dds-rabbit"
+            - name: RABBITMQ_VHOST
+              value: "/"
+            - name: RABBITMQ_QUEUE
+              value: "payment.command.q"

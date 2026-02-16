@@ -58,7 +58,7 @@ kubectl apply -f k8s/
 4. Any config or deployment manifest changes (`docker-compose`, `k8s`, `helm-config`).
 
 ## Plan Maintenance Rules
-- Treat `Final_Redis_RabbitMQ_Implementation_Plan.md` as a living plan.
+- Treat `plans/Final_Redis_RabbitMQ_Implementation_Plan.md` as a living plan.
 - Update the plan immediately when one of these happens:
 1. A phase is blocked by an unexpected issue that changes scope, order, or feasibility.
 2. Test/load/failure evidence contradicts a core assumption.

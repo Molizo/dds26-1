@@ -118,6 +118,9 @@ Durability and policies:
 1. Freeze final external contract and non-negotiables listed above.
 2. Produce transition matrix for Saga states and failure handling.
 3. Write run-order checklist for all phases.
+4. Record the Phase 0 artifacts in `plans/Phase_0_Contract_Freeze.md`.
+5. Freeze checkout timeout behavior:
+   - bounded wait timeout returns `400` (failure).
 
 Expected temporary state:
 1. No behavior change yet.
@@ -292,4 +295,5 @@ Use this protocol whenever unexpected issues arise or implementation opinion cha
 4. Prefer minimal safe deltas to get back to a working migration path.
 
 ## Plan Change Log
-1. 2026-02-16: Added explicit replanning protocol and change-log requirements for handling unexpected issues and design-opinion changes.
+1. 2026-02-16: Phase 0 implementation started. Added `plans/Phase_0_Contract_Freeze.md` as the single appendix artifact; froze checkout bounded-wait timeout behavior to return `400` to preserve synchronous failure semantics.
+2. 2026-02-16: Added explicit replanning protocol and change-log requirements for handling unexpected issues and design-opinion changes.

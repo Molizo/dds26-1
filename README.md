@@ -59,3 +59,21 @@ Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in
   - `payment:<user_id>`
 - During migration from older runtime states, existing stock/payment data is not read-compatible.
 - If upgrading an existing environment, clear stock/payment Redis data and re-seed via the existing create/batch-init endpoints before running tests.
+
+### Phase 6 recovery and DLQ replay notes (2026-02-16)
+
+- New workers:
+  - `order/workers/reconciliation_worker.py`: leader-locked stale saga recovery scanner.
+  - `order/workers/dlq_replay_worker.py`: automatic DLQ replay with bounded attempts.
+- `dlq.parking.q` is a quarantine queue for:
+  - messages with exhausted replay attempts,
+  - messages with invalid/missing source queue metadata.
+- New docker-compose services:
+  - `order-reconciliation-worker`
+  - `dlq-replay-worker`
+- New Kubernetes manifests:
+  - `k8s/order-reconciliation-worker.yaml`
+  - `k8s/dlq-replay-worker.yaml`
+- Key environment knobs:
+  - Reconciliation: `RECOVERY_SCAN_INTERVAL_MS`, `RECOVERY_STALE_AFTER_MS`, `RECOVERY_BATCH_SIZE`, `RECOVERY_STEP_LOCK_TTL_SEC`, `RECOVERY_MAX_ACTIONS_PER_CYCLE`, `RECOVERY_LEADER_LOCK_TTL_MS`.
+  - DLQ replay: `DLQ_REPLAY_QUEUES`, `DLQ_REPLAY_POLL_INTERVAL_MS`, `DLQ_REPLAY_RATE_PER_SEC`, `DLQ_REPLAY_MAX_ATTEMPTS`, `DLQ_REPLAY_ATTEMPT_TTL_SEC`, `DLQ_REPLAY_LEADER_LOCK_TTL_MS`.

@@ -134,6 +134,13 @@
       "durable": true,
       "auto_delete": false,
       "arguments": {}
+    },
+    {
+      "name": "dlq.parking.q",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
     }
   ],
   "exchanges": [
@@ -246,6 +253,15 @@
       "arguments": {}
     },
     {
+      "name": "dlq.parking",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
       "name": "checkout.events",
       "vhost": "/",
       "type": "topic",
@@ -350,6 +366,14 @@
       "destination": "order.command.dlq",
       "destination_type": "queue",
       "routing_key": "order.dlq",
+      "arguments": {}
+    },
+    {
+      "source": "dlq.parking",
+      "vhost": "/",
+      "destination": "dlq.parking.q",
+      "destination_type": "queue",
+      "routing_key": "dlq.parking",
       "arguments": {}
     }
   ]

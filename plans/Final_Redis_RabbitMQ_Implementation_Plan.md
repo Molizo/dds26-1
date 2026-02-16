@@ -190,11 +190,14 @@ Expected temporary state:
 
 ### Phase 6: Reconciliation and Crash Recovery
 1. Add reconciliation worker:
-   - scan stale `PENDING` sagas
+   - scan stale non-terminal sagas (`PENDING`, `RESERVING_STOCK`, `CHARGING_PAYMENT`, `RELEASING_STOCK`, `COMMITTING_ORDER`)
    - replay missing step or compensation
 2. Add startup recovery hooks:
    - continue/reconcile incomplete sagas after worker restart
-3. Add replay tooling for DLQ with idempotent safeguards.
+3. Add automatic DLQ replay worker with idempotent safeguards:
+   - bounded replay attempts per original message
+   - leader lock for single active drainer
+   - parking queue for exhausted or invalid replay candidates
 
 Expected temporary state:
 1. Core flow works; resilience hardening still ongoing.
@@ -306,3 +309,4 @@ Use this protocol whenever unexpected issues arise or implementation opinion cha
 8. 2026-02-16: Phase 4 implementation completed: hardened order/stock/payment worker runtimes with bounded retry (`WORKER_MAX_RETRIES` default 5) using RabbitMQ `x-death` tracking, explicit DLQ forwarding on retry exhaustion or invalid message rejection, configurable prefetch/reconnect backoff, reconnect loops for broker failures, and new Phase 4 tests covering retry/DLQ routing and reconnect recovery behavior.
 9. 2026-02-16: Kubernetes runtime bug fix: `order-deployment` failed to boot with `KeyError: 'GATEWAY_URL'` because `k8s/order-app.yaml` omitted that required env var. Decision: add `GATEWAY_URL=http://ingress-nginx-controller.ingress-nginx.svc.cluster.local` to the order app deployment env so legacy checkout service-to-service calls route through ingress and preserve existing external-path assumptions.
 10. 2026-02-16: Phase 5 implementation completed: replaced synchronous `POST /orders/checkout/{order_id}` internals with Saga orchestration backed by RabbitMQ and bounded wait (`CHECKOUT_WAIT_TIMEOUT_MS` default 3000ms), added order saga state persistence (`saga:{saga_id}`) and order checkout status tracking, implemented order-worker transition orchestration (`CheckoutRequested -> ReserveStock -> ChargePayment -> terminal` with compensation via `ReleaseStock`), upgraded stock/payment workers to publish outcome events (`StockReserved`, `StockRejected`, `PaymentCharged`, `PaymentRejected`, `StockReleased`), added RabbitMQ topology bootstrap in shared messaging to keep local and cluster startup resilient, expanded docker-compose with RabbitMQ and worker services, and added Phase 5 orchestration tests.
+11. 2026-02-16: Phase 6 implementation completed: added `order/workers/reconciliation_worker.py` for leader-locked stale saga reconciliation and state-based recovery re-publish, integrated one-shot startup recovery hook into `order/workers/order_worker.py`, added `order/workers/dlq_replay_worker.py` for automatic DLQ draining with bounded replay attempts and `dlq.parking` quarantine routing, extended topology definitions (`shared_messaging/rabbitmq.py`, `helm-config/rabbitmq-definitions.json`), wired local/k8s deployments for new workers, and added Phase 6 unit coverage for reconciliation and replay flows.

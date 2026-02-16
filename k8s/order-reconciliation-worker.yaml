@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-reconciliation-worker-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      component: order-reconciliation-worker
+      role: worker
+  template:
+    metadata:
+      labels:
+        component: order-reconciliation-worker
+        role: worker
+    spec:
+      containers:
+        - name: order-reconciliation-worker
+          image: order:latest
+          resources:
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+          command: ["python"]
+          args: ["workers/reconciliation_worker.py"]
+          env:
+            - name: REDIS_HOST
+              value: redis-master
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_PASSWORD
+              value: "redis"
+            - name: REDIS_DB
+              value: "0"
+            - name: RABBITMQ_HOST
+              value: rabbitmq
+            - name: RABBITMQ_PORT
+              value: "5672"
+            - name: RABBITMQ_USER
+              value: "dds"
+            - name: RABBITMQ_PASSWORD
+              value: "dds-rabbit"
+            - name: RABBITMQ_VHOST
+              value: "/"
+            - name: RECOVERY_SCAN_INTERVAL_MS
+              value: "5000"
+            - name: RECOVERY_STALE_AFTER_MS
+              value: "15000"
+            - name: RECOVERY_BATCH_SIZE
+              value: "200"
+            - name: RECOVERY_STEP_LOCK_TTL_SEC
+              value: "120"
+            - name: RECOVERY_MAX_ACTIONS_PER_CYCLE
+              value: "500"
+            - name: RECOVERY_LEADER_LOCK_TTL_MS
+              value: "10000"
+            - name: WORKER_RECONNECT_BACKOFF_MS
+              value: "2000"

@@ -167,9 +167,9 @@ It freezes external behavior, captures Saga state/failure transitions, and defin
 - Entry criteria:
   - Saga cutover active.
 - Tasks:
-  - Add stale `PENDING` scanner.
+  - Add stale non-terminal saga scanner (`PENDING`, `RESERVING_STOCK`, `CHARGING_PAYMENT`, `RELEASING_STOCK`, `COMMITTING_ORDER`).
   - Add startup recovery for incomplete saga flow.
-  - Add safe DLQ replay tooling.
+  - Add safe DLQ replay tooling with bounded attempts and parking-queue quarantine.
 - Exit criteria:
   - Crash mid-flow converges to consistent terminal state.
   - Replay tooling is idempotent.

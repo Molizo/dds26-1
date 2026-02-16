@@ -21,3 +21,19 @@ def stock_hash_key(item_id: str) -> str:
 
 def payment_hash_key(user_id: str) -> str:
     return f"payment:{user_id}"
+
+
+def recovery_leader_lock_key() -> str:
+    return "recovery:leader"
+
+
+def recovery_step_lock_key(saga_id: str, step: str) -> str:
+    return f"recovery:step-lock:{saga_id}:{step}"
+
+
+def dlq_replay_leader_lock_key() -> str:
+    return "dlq-replay:leader"
+
+
+def dlq_replay_attempt_key(original_message_id: str) -> str:
+    return f"dlq:replay-attempts:{original_message_id}"

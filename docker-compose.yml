@@ -90,6 +90,50 @@ services:
       - order-service
       - rabbitmq
 
+  order-reconciliation-worker:
+    image: order:latest
+    command: python workers/reconciliation_worker.py
+    env_file:
+      - env/order_redis.env
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=dds
+      - RABBITMQ_PASSWORD=dds-rabbit
+      - RABBITMQ_VHOST=/
+      - RECOVERY_SCAN_INTERVAL_MS=5000
+      - RECOVERY_STALE_AFTER_MS=15000
+      - RECOVERY_BATCH_SIZE=200
+      - RECOVERY_MAX_ACTIONS_PER_CYCLE=500
+      - RECOVERY_STEP_LOCK_TTL_SEC=120
+      - RECOVERY_LEADER_LOCK_TTL_MS=10000
+      - WORKER_RECONNECT_BACKOFF_MS=2000
+    depends_on:
+      - order-service
+      - rabbitmq
+
+  dlq-replay-worker:
+    image: order:latest
+    command: python workers/dlq_replay_worker.py
+    env_file:
+      - env/order_redis.env
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=dds
+      - RABBITMQ_PASSWORD=dds-rabbit
+      - RABBITMQ_VHOST=/
+      - DLQ_REPLAY_QUEUES=checkout.command.dlq,stock.command.dlq,payment.command.dlq,order.command.dlq
+      - DLQ_REPLAY_POLL_INTERVAL_MS=500
+      - DLQ_REPLAY_RATE_PER_SEC=20
+      - DLQ_REPLAY_MAX_ATTEMPTS=3
+      - DLQ_REPLAY_ATTEMPT_TTL_SEC=86400
+      - DLQ_REPLAY_LEADER_LOCK_TTL_MS=10000
+      - WORKER_RECONNECT_BACKOFF_MS=2000
+    depends_on:
+      - order-service
+      - rabbitmq
+
   stock-worker:
     image: stock:latest
     command: python workers/stock_worker.py

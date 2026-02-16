@@ -16,6 +16,7 @@ COMMAND_EXCHANGES: tuple[tuple[str, str], ...] = (
     ("order.command", "direct"),
     ("order.retry", "direct"),
     ("order.dlx", "direct"),
+    ("dlq.parking", "direct"),
     ("checkout.events", "topic"),
 )
 
@@ -84,6 +85,7 @@ QUEUES: tuple[tuple[str, dict[str, object]], ...] = (
         },
     ),
     ("order.command.dlq", {}),
+    ("dlq.parking.q", {}),
 )
 
 BINDINGS: tuple[tuple[str, str, str], ...] = (
@@ -99,6 +101,7 @@ BINDINGS: tuple[tuple[str, str, str], ...] = (
     ("order.command", "order.command.q", "order.command"),
     ("order.retry", "order.command.retry.q", "order.retry"),
     ("order.dlx", "order.command.dlq", "order.dlq"),
+    ("dlq.parking", "dlq.parking.q", "dlq.parking"),
 )
 
 

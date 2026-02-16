@@ -39,6 +39,7 @@ try:
         encode_saga,
         now_ms,
     )
+    from order.workers.reconciliation_worker import run_startup_recovery_once
 except ImportError:
     from messaging import (
         build_rabbitmq_parameters,
@@ -66,6 +67,7 @@ except ImportError:
         encode_saga,
         now_ms,
     )
+    from workers.reconciliation_worker import run_startup_recovery_once
 from shared_messaging.consumer import RETRY_DESTINATION_RETRY, decide_retry_destination
 from shared_messaging.contracts import (
     ChargePaymentPayload,
@@ -523,6 +525,16 @@ def run_consumer():
     reconnect_backoff_ms = _get_int_env("WORKER_RECONNECT_BACKOFF_MS", 2000, min_value=100)
     dlx_exchange = os.environ.get("WORKER_DLX_EXCHANGE", "order.dlx")
     dlx_routing_key = os.environ.get("WORKER_DLX_ROUTING_KEY", "order.dlq")
+    startup_recovery_enabled = os.environ.get("WORKER_STARTUP_RECOVERY_ENABLED", "true").lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+    recovery_stale_after_ms = _get_int_env("RECOVERY_STALE_AFTER_MS", 15000, min_value=1000)
+    recovery_batch_size = _get_int_env("RECOVERY_BATCH_SIZE", 200, min_value=1)
+    recovery_step_lock_ttl_sec = _get_int_env("RECOVERY_STEP_LOCK_TTL_SEC", 120, min_value=1)
+    recovery_startup_max_actions = _get_int_env("RECOVERY_STARTUP_MAX_ACTIONS", 200, min_value=1)
+    recovery_leader_lock_ttl_ms = _get_int_env("RECOVERY_LEADER_LOCK_TTL_MS", 10000, min_value=1000)
 
     while True:
         connection = None
@@ -534,6 +546,31 @@ def run_consumer():
                 ensure_rabbitmq_topology(channel)
             except AttributeError:
                 LOGGER.debug("Skipping topology bootstrap for mocked channel")
+            if startup_recovery_enabled:
+                try:
+                    stats = run_startup_recovery_once(
+                        channel,
+                        db,
+                        stale_after_ms=recovery_stale_after_ms,
+                        batch_size=recovery_batch_size,
+                        step_lock_ttl_sec=recovery_step_lock_ttl_sec,
+                        max_actions=recovery_startup_max_actions,
+                        leader_lock_ttl_ms=recovery_leader_lock_ttl_ms,
+                        owner_token=f"order-worker-startup-{uuid.uuid4()}",
+                    )
+                    if stats is None:
+                        LOGGER.info("Startup recovery skipped (leader lock held elsewhere)")
+                    else:
+                        LOGGER.info(
+                            "Startup recovery stats scanned=%s stale=%s reconciled=%s locked_out=%s errors=%s",
+                            stats["scanned"],
+                            stats["stale"],
+                            stats["reconciled"],
+                            stats["locked_out"],
+                            stats["errors"],
+                        )
+                except Exception:
+                    LOGGER.exception("Startup recovery run failed; continuing with normal consumption")
             channel.basic_qos(prefetch_count=prefetch_count)
             for queue_name in queue_names:
                 channel.basic_consume(

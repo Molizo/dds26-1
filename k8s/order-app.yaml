@@ -40,6 +40,8 @@ spec:
           ports:
             - containerPort: 5000
           env:
+            - name: GATEWAY_URL
+              value: "http://ingress-nginx-controller.ingress-nginx.svc.cluster.local"
             - name: USER_SERVICE_URL
               value: "user-service"
             - name: STOCK_SERVICE_URL

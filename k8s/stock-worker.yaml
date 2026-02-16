@@ -17,6 +17,7 @@ spec:
       containers:
         - name: stock-worker
           image: stock:latest
+          imagePullPolicy: Never
           resources:
             limits:
               memory: "512Mi"

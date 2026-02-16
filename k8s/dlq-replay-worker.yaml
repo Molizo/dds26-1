@@ -17,6 +17,7 @@ spec:
       containers:
         - name: dlq-replay-worker
           image: order:latest
+          imagePullPolicy: Never
           resources:
             limits:
               memory: "512Mi"

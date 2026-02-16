@@ -17,6 +17,7 @@ spec:
       containers:
         - name: order-worker
           image: order:latest
+          imagePullPolicy: Never
           resources:
             limits:
               memory: "512Mi"

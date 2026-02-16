@@ -28,6 +28,7 @@ spec:
       containers:
         - name: user
           image: user:latest
+          imagePullPolicy: Never
           resources:
             limits:
               memory: "1Gi"

@@ -17,6 +17,7 @@ spec:
       containers:
         - name: payment-worker
           image: user:latest
+          imagePullPolicy: Never
           resources:
             limits:
               memory: "512Mi"

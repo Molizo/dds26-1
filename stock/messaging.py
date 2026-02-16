@@ -4,11 +4,18 @@ from shared_messaging.codec import decode_message, encode_message
 from shared_messaging.consumer import ConsumerDecision, validate_for_consumer
 from shared_messaging.contracts import MessageMetadata
 from shared_messaging.logging import get_correlation_logger
-from shared_messaging.rabbitmq import get_rabbitmq_connection_parameters
+from shared_messaging.rabbitmq import (
+    ensure_default_topology,
+    get_rabbitmq_connection_parameters,
+)
 
 
 def build_rabbitmq_parameters():
     return get_rabbitmq_connection_parameters()
+
+
+def ensure_rabbitmq_topology(channel) -> None:
+    ensure_default_topology(channel)
 
 
 def decode_internal_message(raw_message: bytes | str):

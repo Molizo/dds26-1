@@ -48,6 +48,10 @@ class StockRejectedPayload(Struct, kw_only=True):
     reason: str
 
 
+class StockReleasedPayload(Struct, kw_only=True):
+    items: list[ItemQuantity]
+
+
 class ChargePaymentPayload(Struct, kw_only=True):
     user_id: str
     amount: int
@@ -84,6 +88,7 @@ MESSAGE_PAYLOAD_TYPES: dict[str, type[Struct]] = {
     "ReserveStock": ReserveStockPayload,
     "StockReserved": StockReservedPayload,
     "StockRejected": StockRejectedPayload,
+    "StockReleased": StockReleasedPayload,
     "ChargePayment": ChargePaymentPayload,
     "PaymentCharged": PaymentChargedPayload,
     "PaymentRejected": PaymentRejectedPayload,

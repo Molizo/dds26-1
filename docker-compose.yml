@@ -1,5 +1,13 @@
 version: "3"
 services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    environment:
+      - RABBITMQ_DEFAULT_USER=dds
+      - RABBITMQ_DEFAULT_PASS=dds-rabbit
+    ports:
+      - "5672:5672"
+      - "15672:15672"
 
   gateway:
     image: nginx:1.25-bookworm
@@ -19,11 +27,17 @@ services:
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=dds
+      - RABBITMQ_PASSWORD=dds-rabbit
+      - RABBITMQ_VHOST=/
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:
       - order-db
+      - rabbitmq
 
   order-db:
     image: redis:7.2-bookworm
@@ -54,6 +68,69 @@ services:
       - env/payment_redis.env
     depends_on:
       - payment-db
+
+  order-worker:
+    image: order:latest
+    command: python workers/order_worker.py
+    env_file:
+      - env/order_redis.env
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=dds
+      - RABBITMQ_PASSWORD=dds-rabbit
+      - RABBITMQ_VHOST=/
+      - WORKER_QUEUES=checkout.command.q,order.command.q
+      - WORKER_PREFETCH_COUNT=1
+      - WORKER_MAX_RETRIES=5
+      - WORKER_RECONNECT_BACKOFF_MS=2000
+      - WORKER_DLX_EXCHANGE=order.dlx
+      - WORKER_DLX_ROUTING_KEY=order.dlq
+    depends_on:
+      - order-service
+      - rabbitmq
+
+  stock-worker:
+    image: stock:latest
+    command: python workers/stock_worker.py
+    env_file:
+      - env/stock_redis.env
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=dds
+      - RABBITMQ_PASSWORD=dds-rabbit
+      - RABBITMQ_VHOST=/
+      - RABBITMQ_QUEUE=stock.command.q
+      - WORKER_PREFETCH_COUNT=1
+      - WORKER_MAX_RETRIES=5
+      - WORKER_RECONNECT_BACKOFF_MS=2000
+      - WORKER_DLX_EXCHANGE=stock.dlx
+      - WORKER_DLX_ROUTING_KEY=stock.dlq
+    depends_on:
+      - stock-service
+      - rabbitmq
+
+  payment-worker:
+    image: user:latest
+    command: python workers/payment_worker.py
+    env_file:
+      - env/payment_redis.env
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=dds
+      - RABBITMQ_PASSWORD=dds-rabbit
+      - RABBITMQ_VHOST=/
+      - RABBITMQ_QUEUE=payment.command.q
+      - WORKER_PREFETCH_COUNT=1
+      - WORKER_MAX_RETRIES=5
+      - WORKER_RECONNECT_BACKOFF_MS=2000
+      - WORKER_DLX_EXCHANGE=payment.dlx
+      - WORKER_DLX_ROUTING_KEY=payment.dlq
+    depends_on:
+      - payment-service
+      - rabbitmq
 
   payment-db:
     image: redis:7.2-bookworm

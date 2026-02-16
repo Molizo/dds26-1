@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import pika
@@ -11,9 +12,20 @@ SERVICE_ROOT = Path(__file__).resolve().parents[1]
 if str(SERVICE_ROOT) not in sys.path:
     sys.path.append(str(SERVICE_ROOT))
 
-from messaging import build_rabbitmq_parameters, decide_message_action, get_message_logger
+from messaging import (
+    build_rabbitmq_parameters,
+    decide_message_action,
+    encode_internal_message,
+    ensure_rabbitmq_topology,
+    get_message_logger,
+)
 from shared_messaging.consumer import RETRY_DESTINATION_RETRY, decide_retry_destination
-from shared_messaging.contracts import ChargePaymentPayload
+from shared_messaging.contracts import (
+    ChargePaymentPayload,
+    MessageMetadata,
+    PaymentChargedPayload,
+    PaymentRejectedPayload,
+)
 from shared_messaging.idempotency import PROCESS_ACTION_RETRY, process_idempotent_step
 from shared_messaging.redis_atomic import charge_payment_atomic
 
@@ -40,6 +52,113 @@ def _get_int_env(name: str, default: int, *, min_value: int = 0) -> int:
         LOGGER.warning("Out-of-range %s=%s; using default=%s", name, raw, default)
         return default
     return parsed
+
+
+def _build_next_metadata(source: MessageMetadata, *, step: str) -> MessageMetadata:
+    return MessageMetadata(
+        message_id=str(uuid.uuid4()),
+        saga_id=source.saga_id,
+        order_id=source.order_id,
+        step=step,
+        attempt=0,
+        timestamp=int(time.time() * 1000),
+        correlation_id=source.correlation_id,
+        causation_id=source.message_id,
+    )
+
+
+def _publish_internal_message(
+    channel,
+    *,
+    exchange: str,
+    routing_key: str,
+    message_type: str,
+    metadata: MessageMetadata,
+    payload: object,
+):
+    body = encode_internal_message(message_type, metadata, payload)
+    channel.basic_publish(
+        exchange=exchange,
+        routing_key=routing_key,
+        body=body,
+        properties=pika.BasicProperties(
+            content_type="application/json",
+            correlation_id=metadata.correlation_id,
+            delivery_mode=2,
+            message_id=metadata.message_id,
+            timestamp=int(time.time()),
+            type=message_type,
+        ),
+        mandatory=False,
+    )
+
+
+def _publish_payment_charged(channel, metadata: MessageMetadata, amount: int) -> None:
+    next_metadata = _build_next_metadata(metadata, step="payment_charged")
+    _publish_internal_message(
+        channel,
+        exchange="order.command",
+        routing_key="order.command",
+        message_type="PaymentCharged",
+        metadata=next_metadata,
+        payload=PaymentChargedPayload(amount=amount),
+    )
+
+
+def _publish_payment_rejected(channel, metadata: MessageMetadata, reason: str) -> None:
+    next_metadata = _build_next_metadata(metadata, step="payment_rejected")
+    _publish_internal_message(
+        channel,
+        exchange="order.command",
+        routing_key="order.command",
+        message_type="PaymentRejected",
+        metadata=next_metadata,
+        payload=PaymentRejectedPayload(reason=reason),
+    )
+
+
+def process_delivery(channel, body: bytes) -> str:
+    decision = decide_message_action(body)
+    if decision.action != "ack" or decision.message is None:
+        LOGGER.warning("Rejected message: %s", decision.reason)
+        return "reject"
+
+    message = decision.message
+    message_logger = get_message_logger(LOGGER, message.metadata)
+    message_logger.info("Validated message type=%s", message.message_type)
+
+    if message.message_type != "ChargePayment":
+        message_logger.warning("Unsupported payment worker message type=%s", message.message_type)
+        return "reject"
+
+    payload = message.payload
+    if not isinstance(payload, ChargePaymentPayload):
+        message_logger.warning("Invalid payload type for ChargePayment")
+        return "reject"
+
+    outcome = process_idempotent_step(
+        apply_effect=lambda: charge_payment_atomic(
+            db,
+            service="payment-worker",
+            message_id=message.metadata.message_id,
+            user_id=payload.user_id,
+            step=f"{message.metadata.step}:charge",
+            amount=payload.amount,
+        ),
+        on_applied=lambda: _publish_payment_charged(channel, message.metadata, payload.amount),
+        on_duplicate=lambda: _publish_payment_charged(channel, message.metadata, payload.amount),
+        on_rejected=lambda _result: _publish_payment_rejected(
+            channel,
+            message.metadata,
+            "payment_rejected",
+        ),
+    )
+
+    if outcome.action == PROCESS_ACTION_RETRY:
+        message_logger.warning("Retrying ChargePayment due to infra error: %s", outcome.reason)
+        return "retry"
+
+    return "ack"
 
 
 def _forward_to_exchange(
@@ -77,49 +196,6 @@ def _forward_to_exchange(
     )
 
 
-def process_delivery(body: bytes) -> str:
-    decision = decide_message_action(body)
-    if decision.action != "ack" or decision.message is None:
-        LOGGER.warning("Rejected message: %s", decision.reason)
-        return "reject"
-
-    message = decision.message
-    message_logger = get_message_logger(LOGGER, message.metadata)
-    message_logger.info("Validated message type=%s", message.message_type)
-
-    if message.message_type != "ChargePayment":
-        message_logger.warning("Unsupported payment worker message type=%s", message.message_type)
-        return "reject"
-
-    payload = message.payload
-    if not isinstance(payload, ChargePaymentPayload):
-        message_logger.warning("Invalid payload type for ChargePayment")
-        return "reject"
-    outcome = process_idempotent_step(
-        apply_effect=lambda: charge_payment_atomic(
-            db,
-            service="payment-worker",
-            message_id=message.metadata.message_id,
-            user_id=payload.user_id,
-            step=f"{message.metadata.step}:charge",
-            amount=payload.amount,
-        )
-    )
-
-    if outcome.action == PROCESS_ACTION_RETRY:
-        message_logger.warning("Retrying ChargePayment due to infra error: %s", outcome.reason)
-        return "retry"
-
-    if outcome.status == "business_reject":
-        message_logger.info(
-            "ChargePayment business rejection for order=%s user=%s reason=%s",
-            message.metadata.order_id,
-            payload.user_id,
-            outcome.reason,
-        )
-    return "ack"
-
-
 def on_message(
     channel,
     method,
@@ -131,7 +207,7 @@ def on_message(
     dlx_exchange: str,
     dlx_routing_key: str,
 ):
-    action = process_delivery(body)
+    action = process_delivery(channel, body)
     if action == "ack":
         channel.basic_ack(delivery_tag=method.delivery_tag)
     elif action == "retry":
@@ -186,6 +262,10 @@ def run_consumer():
         try:
             connection = pika.BlockingConnection(build_rabbitmq_parameters())
             channel = connection.channel()
+            try:
+                ensure_rabbitmq_topology(channel)
+            except AttributeError:
+                LOGGER.debug("Skipping topology bootstrap for mocked channel")
             channel.basic_qos(prefetch_count=prefetch_count)
             channel.basic_consume(
                 queue=queue_name,

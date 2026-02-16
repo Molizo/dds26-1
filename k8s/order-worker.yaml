@@ -47,6 +47,8 @@ spec:
               value: "/"
             - name: RABBITMQ_QUEUE
               value: "order.command.q"
+            - name: WORKER_QUEUES
+              value: "checkout.command.q,order.command.q"
             - name: WORKER_PREFETCH_COUNT
               value: "1"
             - name: WORKER_MAX_RETRIES

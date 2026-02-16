@@ -54,3 +54,13 @@ spec:
               value: "redis"
             - name: REDIS_DB
               value: "0"
+            - name: RABBITMQ_HOST
+              value: rabbitmq
+            - name: RABBITMQ_PORT
+              value: "5672"
+            - name: RABBITMQ_USER
+              value: "dds"
+            - name: RABBITMQ_PASSWORD
+              value: "dds-rabbit"
+            - name: RABBITMQ_VHOST
+              value: "/"

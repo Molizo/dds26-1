@@ -23,6 +23,7 @@ from shared_messaging.contracts import (
     ReleaseStockPayload,
     ReserveStockPayload,
     StockRejectedPayload,
+    StockReleasedPayload,
     StockReservedPayload,
 )
 from shared_messaging.errors import MessageValidationError, UnsupportedMessageTypeError
@@ -53,6 +54,7 @@ def build_payloads() -> dict[str, object]:
         "ReserveStock": ReserveStockPayload(items=items),
         "StockReserved": StockReservedPayload(items=items),
         "StockRejected": StockRejectedPayload(reason="out_of_stock"),
+        "StockReleased": StockReleasedPayload(items=items),
         "ChargePayment": ChargePaymentPayload(user_id="user-1", amount=20),
         "PaymentCharged": PaymentChargedPayload(amount=20),
         "PaymentRejected": PaymentRejectedPayload(reason="insufficient_credit"),

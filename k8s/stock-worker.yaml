@@ -47,3 +47,13 @@ spec:
               value: "/"
             - name: RABBITMQ_QUEUE
               value: "stock.command.q"
+            - name: WORKER_PREFETCH_COUNT
+              value: "1"
+            - name: WORKER_MAX_RETRIES
+              value: "5"
+            - name: WORKER_RECONNECT_BACKOFF_MS
+              value: "2000"
+            - name: WORKER_DLX_EXCHANGE
+              value: "stock.dlx"
+            - name: WORKER_DLX_ROUTING_KEY
+              value: "stock.dlq"

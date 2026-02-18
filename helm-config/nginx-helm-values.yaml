@@ -1,7 +1,13 @@
-resources:
-  limits:
-    cpu: 500m
-    memory: 1Gi
-  requests:
-    cpu: 500m
-    memory: 1Gi
+controller:
+  resources:
+    limits:
+      cpu: 1500m
+      memory: 1Gi
+    requests:
+      cpu: 500m
+      memory: 512Mi
+  config:
+    worker-processes: "auto"
+    max-worker-connections: "16384"
+    upstream-keepalive-connections: "256"
+    keep-alive-requests: "10000"

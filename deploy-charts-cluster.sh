@@ -9,6 +9,7 @@ fi
 
 helm repo add bitnami https://charts.bitnami.com/bitnami
 helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo add kedacore https://kedacore.github.io/charts
 helm repo update
 
 kubectl create secret generic rabbitmq-load-definition \
@@ -18,3 +19,4 @@ kubectl create secret generic rabbitmq-load-definition \
 helm upgrade --install -f helm-config/redis-helm-values.yaml redis bitnami/redis
 helm upgrade --install -f helm-config/rabbitmq-helm-values.yaml rabbitmq bitnami/rabbitmq
 helm upgrade --install -f helm-config/nginx-helm-values.yaml nginx ingress-nginx/ingress-nginx
+helm upgrade --install keda kedacore/keda --namespace keda --create-namespace

@@ -99,6 +99,55 @@ class TestPhase5CheckoutOrchestration(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         mock_mark_failed.assert_called_once_with(created_saga, "timeout")
 
+    @patch("order.app.wait_for_terminal_saga")
+    @patch("order.app.publish_checkout_requested")
+    @patch("order.app.ensure_saga_for_checkout")
+    @patch("order.app.get_order_active_saga_id", return_value="s-existing")
+    @patch("order.app.acquire_checkout_lock", return_value=None)
+    @patch("order.app.get_order_from_db")
+    def test_checkout_reuses_existing_saga_when_lock_not_acquired(
+        self,
+        mock_get_order,
+        _mock_lock,
+        _mock_active_saga,
+        mock_ensure_saga,
+        mock_publish,
+        mock_wait,
+    ):
+        order_entry = OrderValue(paid=False, items=[("item-1", 2)], user_id="u1", total_cost=10)
+        terminal_saga = SagaValue(
+            saga_id="s-existing",
+            order_id="o1",
+            user_id="u1",
+            items=[],
+            total_cost=10,
+            state=SAGA_STATE_COMPLETED,
+        )
+        mock_get_order.return_value = order_entry
+        mock_wait.return_value = terminal_saga
+
+        response = self.client.post("/checkout/o1")
+
+        self.assertEqual(response.status_code, 200)
+        mock_ensure_saga.assert_not_called()
+        mock_publish.assert_not_called()
+
+    @patch("order.app.get_order_active_saga_id", return_value=None)
+    @patch("order.app.acquire_checkout_lock", return_value=None)
+    @patch("order.app.get_order_from_db")
+    def test_checkout_returns_400_if_lock_not_acquired_and_no_active_saga(
+        self,
+        mock_get_order,
+        _mock_lock,
+        _mock_active_saga,
+    ):
+        order_entry = OrderValue(paid=False, items=[("item-1", 2)], user_id="u1", total_cost=10)
+        mock_get_order.return_value = order_entry
+
+        response = self.client.post("/checkout/o1")
+
+        self.assertEqual(response.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()

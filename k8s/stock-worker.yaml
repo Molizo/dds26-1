@@ -3,7 +3,7 @@ kind: Deployment
 metadata:
   name: stock-worker-deployment
 spec:
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       component: stock-worker
@@ -21,10 +21,10 @@ spec:
           resources:
             limits:
               memory: "512Mi"
-              cpu: "500m"
+              cpu: "1"
             requests:
               memory: "256Mi"
-              cpu: "250m"
+              cpu: "500m"
           command: ["python"]
           args: ["workers/stock_worker.py"]
           env:
@@ -46,10 +46,12 @@ spec:
               value: "dds-rabbit"
             - name: RABBITMQ_VHOST
               value: "/"
+            - name: RABBITMQ_CONNECTION
+              value: "amqp://dds:dds-rabbit@rabbitmq.default.svc.cluster.local:5672/%2F"
             - name: RABBITMQ_QUEUE
               value: "stock.command.q"
             - name: WORKER_PREFETCH_COUNT
-              value: "1"
+              value: "8"
             - name: WORKER_MAX_RETRIES
               value: "5"
             - name: WORKER_RECONNECT_BACKOFF_MS

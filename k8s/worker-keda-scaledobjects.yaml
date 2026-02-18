@@ -1,0 +1,66 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: order-worker-rabbitmq-scaler
+spec:
+  scaleTargetRef:
+    name: order-worker-deployment
+  pollingInterval: 3
+  cooldownPeriod: 60
+  minReplicaCount: 3
+  maxReplicaCount: 20
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: amqp
+        mode: QueueLength
+        host: amqp://dds:dds-rabbit@rabbitmq.default.svc.cluster.local:5672/%2F
+        queueName: checkout.command.q
+        value: "3"
+    - type: rabbitmq
+      metadata:
+        protocol: amqp
+        mode: QueueLength
+        host: amqp://dds:dds-rabbit@rabbitmq.default.svc.cluster.local:5672/%2F
+        queueName: order.command.q
+        value: "3"
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: stock-worker-rabbitmq-scaler
+spec:
+  scaleTargetRef:
+    name: stock-worker-deployment
+  pollingInterval: 3
+  cooldownPeriod: 60
+  minReplicaCount: 3
+  maxReplicaCount: 20
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: amqp
+        mode: QueueLength
+        host: amqp://dds:dds-rabbit@rabbitmq.default.svc.cluster.local:5672/%2F
+        queueName: stock.command.q
+        value: "3"
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: payment-worker-rabbitmq-scaler
+spec:
+  scaleTargetRef:
+    name: payment-worker-deployment
+  pollingInterval: 3
+  cooldownPeriod: 60
+  minReplicaCount: 3
+  maxReplicaCount: 20
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: amqp
+        mode: QueueLength
+        host: amqp://dds:dds-rabbit@rabbitmq.default.svc.cluster.local:5672/%2F
+        queueName: payment.command.q
+        value: "3"

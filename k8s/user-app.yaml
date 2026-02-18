@@ -16,7 +16,7 @@ kind: Deployment
 metadata:
   name: user-deployment
 spec:
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       component: user
@@ -34,10 +34,10 @@ spec:
               memory: "1Gi"
               cpu: "1"
             requests:
-              memory: "1Gi"
-              cpu: "1"
+              memory: "256Mi"
+              cpu: "250m"
           command: ["gunicorn"]
-          args: ["-b", "0.0.0.0:5000", "app:app"]
+          args: ["-b", "0.0.0.0:5000", "-w", "4", "--threads", "8", "--timeout", "30", "app:app"]
           ports:
             - containerPort: 5000
           env:

@@ -2,6 +2,7 @@ import atexit
 import logging
 import os
 import random
+import threading
 import time
 import uuid
 
@@ -51,11 +52,15 @@ DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ["GATEWAY_URL"]
+STOCK_SERVICE_URL = os.environ.get("STOCK_SERVICE_URL", "")
+STOCK_SERVICE_PORT = int(os.environ.get("STOCK_SERVICE_PORT", "5000"))
 
 CHECKOUT_WAIT_TIMEOUT_MS = int(os.environ.get("CHECKOUT_WAIT_TIMEOUT_MS", "3000"))
 CHECKOUT_WAIT_POLL_MS = int(os.environ.get("CHECKOUT_WAIT_POLL_MS", "50"))
+CHECKOUT_WAIT_MAX_POLL_MS = int(os.environ.get("CHECKOUT_WAIT_MAX_POLL_MS", "200"))
 CHECKOUT_LOCK_WAIT_MS = int(os.environ.get("CHECKOUT_LOCK_WAIT_MS", "1000"))
 CHECKOUT_LOCK_EX_SEC = int(os.environ.get("CHECKOUT_LOCK_EX_SEC", "5"))
+CHECKOUT_LOCK_POLL_MS = int(os.environ.get("CHECKOUT_LOCK_POLL_MS", "10"))
 
 app = Flask("order-service")
 
@@ -66,12 +71,29 @@ db: redis.Redis = redis.Redis(
     db=int(os.environ["REDIS_DB"]),
 )
 
+publisher_local = threading.local()
+
 
 def close_db_connection():
     db.close()
 
 
 atexit.register(close_db_connection)
+
+
+def close_publisher_connection() -> None:
+    connection = getattr(publisher_local, "connection", None)
+    if connection is not None:
+        try:
+            if connection.is_open:
+                connection.close()
+        except Exception:
+            app.logger.debug("Publisher connection already closed during shutdown")
+    publisher_local.connection = None
+    publisher_local.channel = None
+
+
+atexit.register(close_publisher_connection)
 
 
 def saga_key(saga_id: str) -> str:
@@ -134,6 +156,58 @@ def send_get_request(url: str):
     return response
 
 
+def normalize_service_base_url(raw: str, *, default_port: int) -> str:
+    stripped = raw.strip()
+    if not stripped:
+        return ""
+    if stripped.startswith("http://") or stripped.startswith("https://"):
+        return stripped.rstrip("/")
+    if ":" in stripped:
+        return f"http://{stripped.rstrip('/')}"
+    return f"http://{stripped}:{default_port}"
+
+
+def get_stock_lookup_url(item_id: str) -> str:
+    stock_base = normalize_service_base_url(STOCK_SERVICE_URL, default_port=STOCK_SERVICE_PORT)
+    if stock_base:
+        return f"{stock_base}/find/{item_id}"
+    return f"{GATEWAY_URL}/stock/find/{item_id}"
+
+
+def reset_publisher_connection() -> None:
+    connection = getattr(publisher_local, "connection", None)
+    channel = getattr(publisher_local, "channel", None)
+    if channel is not None:
+        try:
+            if channel.is_open:
+                channel.close()
+        except Exception:
+            app.logger.debug("Publisher channel already closed")
+    if connection is not None:
+        try:
+            if connection.is_open:
+                connection.close()
+        except Exception:
+            app.logger.debug("Publisher connection already closed")
+    publisher_local.connection = None
+    publisher_local.channel = None
+
+
+def get_checkout_publisher_channel():
+    connection = getattr(publisher_local, "connection", None)
+    channel = getattr(publisher_local, "channel", None)
+    if connection is not None and channel is not None and connection.is_open and channel.is_open:
+        return channel
+
+    reset_publisher_connection()
+    connection = pika.BlockingConnection(build_rabbitmq_parameters())
+    channel = connection.channel()
+    ensure_rabbitmq_topology(channel)
+    publisher_local.connection = connection
+    publisher_local.channel = channel
+    return channel
+
+
 def build_message_metadata(
     *,
     saga_id: str,
@@ -170,27 +244,28 @@ def publish_checkout_requested(saga_entry: SagaValue) -> None:
     )
     body = encode_internal_message("CheckoutRequested", metadata, payload)
 
-    connection = pika.BlockingConnection(build_rabbitmq_parameters())
-    try:
-        channel = connection.channel()
-        ensure_rabbitmq_topology(channel)
-        channel.basic_publish(
-            exchange="checkout.command",
-            routing_key="checkout.command",
-            body=body,
-            properties=pika.BasicProperties(
-                content_type="application/json",
-                delivery_mode=2,
-                message_id=metadata.message_id,
-                correlation_id=metadata.correlation_id,
-                timestamp=int(time.time()),
-                type="CheckoutRequested",
-            ),
-            mandatory=False,
-        )
-    finally:
-        if connection.is_open:
-            connection.close()
+    for attempt in range(2):
+        channel = get_checkout_publisher_channel()
+        try:
+            channel.basic_publish(
+                exchange="checkout.command",
+                routing_key="checkout.command",
+                body=body,
+                properties=pika.BasicProperties(
+                    content_type="application/json",
+                    delivery_mode=2,
+                    message_id=metadata.message_id,
+                    correlation_id=metadata.correlation_id,
+                    timestamp=int(time.time()),
+                    type="CheckoutRequested",
+                ),
+                mandatory=False,
+            )
+            return
+        except Exception:
+            reset_publisher_connection()
+            if attempt == 1:
+                raise
 
 
 def aggregate_items(items: list[tuple[str, int]]) -> list[ItemQuantity]:
@@ -232,6 +307,7 @@ def acquire_checkout_lock(order_id: str) -> str | None:
     deadline = now_ms() + CHECKOUT_LOCK_WAIT_MS
     lock_key = checkout_lock_key(order_id)
     token = str(uuid.uuid4())
+    poll_ms = max(1, CHECKOUT_LOCK_POLL_MS)
     while now_ms() < deadline:
         try:
             acquired = db.set(lock_key, token, nx=True, ex=CHECKOUT_LOCK_EX_SEC)
@@ -239,7 +315,7 @@ def acquire_checkout_lock(order_id: str) -> str | None:
             abort(400, DB_ERROR_STR)
         if acquired:
             return token
-        time.sleep(CHECKOUT_WAIT_POLL_MS / 1000)
+        time.sleep(poll_ms / 1000)
     return None
 
 
@@ -284,14 +360,32 @@ def ensure_saga_for_checkout(order_id: str, order_entry: OrderValue) -> tuple[Sa
 
 def wait_for_terminal_saga(saga_id: str) -> SagaValue | None:
     deadline = now_ms() + CHECKOUT_WAIT_TIMEOUT_MS
+    poll_ms = max(5, CHECKOUT_WAIT_POLL_MS)
+    max_poll_ms = max(poll_ms, CHECKOUT_WAIT_MAX_POLL_MS)
     while now_ms() < deadline:
         saga_entry = get_saga_from_db(saga_id)
         if saga_entry is None:
             return None
         if saga_entry.state in SAGA_TERMINAL_STATES:
             return saga_entry
-        time.sleep(CHECKOUT_WAIT_POLL_MS / 1000)
+        time.sleep(poll_ms / 1000)
+        poll_ms = min(poll_ms * 2, max_poll_ms)
     return None
+
+
+def finalize_checkout(saga_id: str) -> Response:
+    terminal = wait_for_terminal_saga(saga_id)
+    if terminal is None:
+        latest = get_saga_from_db(saga_id)
+        if latest is not None and latest.state not in SAGA_TERMINAL_STATES:
+            mark_saga_failed(latest, "timeout")
+        abort(400, "Checkout timed out")
+
+    if terminal.state == SAGA_STATE_COMPLETED:
+        return Response("Checkout successful", status=200)
+
+    reason = terminal.failure_reason or "checkout_failed"
+    abort(400, f"Checkout failed: {reason}")
 
 
 @app.post("/create/<user_id>")
@@ -348,7 +442,7 @@ def find_order(order_id: str):
 @app.post("/addItem/<order_id>/<item_id>/<quantity>")
 def add_item(order_id: str, item_id: str, quantity: int):
     order_entry = get_order_from_db(order_id)
-    item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
+    item_reply = send_get_request(get_stock_lookup_url(item_id))
     if item_reply.status_code != 200:
         abort(400, f"Item: {item_id} does not exist!")
 
@@ -370,6 +464,12 @@ def checkout(order_id: str):
         abort(400, f"Order: {order_id} has already been paid")
 
     lock_token = acquire_checkout_lock(order_id)
+    if lock_token is None:
+        existing_saga_id = get_order_active_saga_id(order_id)
+        if existing_saga_id is None:
+            abort(400, "Checkout already in progress")
+        return finalize_checkout(existing_saga_id)
+
     try:
         saga_entry, created_now = ensure_saga_for_checkout(order_id, order_entry)
         if created_now:
@@ -386,18 +486,7 @@ def checkout(order_id: str):
     finally:
         release_checkout_lock(order_id, lock_token)
 
-    terminal = wait_for_terminal_saga(saga_entry.saga_id)
-    if terminal is None:
-        latest = get_saga_from_db(saga_entry.saga_id)
-        if latest is not None and latest.state not in SAGA_TERMINAL_STATES:
-            mark_saga_failed(latest, "timeout")
-        abort(400, "Checkout timed out")
-
-    if terminal.state == SAGA_STATE_COMPLETED:
-        return Response("Checkout successful", status=200)
-
-    reason = terminal.failure_reason or "checkout_failed"
-    abort(400, f"Checkout failed: {reason}")
+    return finalize_checkout(saga_entry.saga_id)
 
 
 if __name__ == "__main__":

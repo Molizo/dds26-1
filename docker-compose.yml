@@ -27,12 +27,14 @@ services:
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
+      - STOCK_SERVICE_URL=stock-service
+      - STOCK_SERVICE_PORT=5000
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=dds
       - RABBITMQ_PASSWORD=dds-rabbit
       - RABBITMQ_VHOST=/
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 4 --threads 8 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:
@@ -48,7 +50,7 @@ services:
       context: .
       dockerfile: stock/Dockerfile
     image: stock:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 4 --threads 8 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
     depends_on:
@@ -63,7 +65,7 @@ services:
       context: .
       dockerfile: payment/Dockerfile
     image: user:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 4 --threads 8 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
     depends_on:
@@ -81,7 +83,7 @@ services:
       - RABBITMQ_PASSWORD=dds-rabbit
       - RABBITMQ_VHOST=/
       - WORKER_QUEUES=checkout.command.q,order.command.q
-      - WORKER_PREFETCH_COUNT=1
+      - WORKER_PREFETCH_COUNT=8
       - WORKER_MAX_RETRIES=5
       - WORKER_RECONNECT_BACKOFF_MS=2000
       - WORKER_DLX_EXCHANGE=order.dlx
@@ -146,7 +148,7 @@ services:
       - RABBITMQ_PASSWORD=dds-rabbit
       - RABBITMQ_VHOST=/
       - RABBITMQ_QUEUE=stock.command.q
-      - WORKER_PREFETCH_COUNT=1
+      - WORKER_PREFETCH_COUNT=8
       - WORKER_MAX_RETRIES=5
       - WORKER_RECONNECT_BACKOFF_MS=2000
       - WORKER_DLX_EXCHANGE=stock.dlx
@@ -167,7 +169,7 @@ services:
       - RABBITMQ_PASSWORD=dds-rabbit
       - RABBITMQ_VHOST=/
       - RABBITMQ_QUEUE=payment.command.q
-      - WORKER_PREFETCH_COUNT=1
+      - WORKER_PREFETCH_COUNT=8
       - WORKER_MAX_RETRIES=5
       - WORKER_RECONNECT_BACKOFF_MS=2000
       - WORKER_DLX_EXCHANGE=payment.dlx

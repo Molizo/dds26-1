@@ -204,12 +204,21 @@ Expected temporary state:
 
 ### Phase 7: Performance and Scalability Tuning
 1. Separate autoscaling for API and worker deployments.
+   - Prefer queue-depth autoscaling (KEDA) for workers over CPU-only HPA.
 2. Tune:
    - RabbitMQ prefetch
    - consumer concurrency
    - retry backoff parameters
 3. Remove internal checkout-path REST chaining and gateway hairpin paths.
 4. Run progressive load stages (10k, 25k, 50k concurrent).
+5. Baseline throughput profile for current implementation:
+   - API deployments start at `replicas: 1` with explicit Gunicorn worker+thread concurrency.
+   - Worker deployments start at `replicas: 1` with `WORKER_PREFETCH_COUNT=8`.
+6. Move checkout publish path off per-request RabbitMQ connection setup:
+   - Reuse per-thread publisher connection/channel with reconnect fallback.
+   - Keep topology declaration at connection bootstrap only.
+7. Increase ingress capacity defaults for high fan-in:
+   - tune worker connections and upstream keepalive settings.
 
 Expected temporary state:
 1. Functional behavior stable; performance still being optimized.
@@ -222,6 +231,7 @@ Expected temporary state:
    - DLQ drain
    - worker crash recovery
 4. Lock deployment manifests and documentation.
+5. Store runbooks in-repo under `plans/runbooks/` and keep them versioned with manifest/runtime changes.
 
 Expected final state:
 1. Contract-compatible API.
@@ -251,6 +261,7 @@ Expected final state:
    - Force redelivery and ensure no duplicate effect.
 4. Throughput and latency:
    - Measure p95/p99 and queue backlog at staged concurrency.
+   - Measure at progressive stages (2k, 5k, 10k) before attempting 25k/50k.
 5. Contract compatibility:
    - Existing API tests pass without endpoint changes.
 6. DLQ handling:
@@ -310,3 +321,8 @@ Use this protocol whenever unexpected issues arise or implementation opinion cha
 9. 2026-02-16: Kubernetes runtime bug fix: `order-deployment` failed to boot with `KeyError: 'GATEWAY_URL'` because `k8s/order-app.yaml` omitted that required env var. Decision: add `GATEWAY_URL=http://ingress-nginx-controller.ingress-nginx.svc.cluster.local` to the order app deployment env so legacy checkout service-to-service calls route through ingress and preserve existing external-path assumptions.
 10. 2026-02-16: Phase 5 implementation completed: replaced synchronous `POST /orders/checkout/{order_id}` internals with Saga orchestration backed by RabbitMQ and bounded wait (`CHECKOUT_WAIT_TIMEOUT_MS` default 3000ms), added order saga state persistence (`saga:{saga_id}`) and order checkout status tracking, implemented order-worker transition orchestration (`CheckoutRequested -> ReserveStock -> ChargePayment -> terminal` with compensation via `ReleaseStock`), upgraded stock/payment workers to publish outcome events (`StockReserved`, `StockRejected`, `PaymentCharged`, `PaymentRejected`, `StockReleased`), added RabbitMQ topology bootstrap in shared messaging to keep local and cluster startup resilient, expanded docker-compose with RabbitMQ and worker services, and added Phase 5 orchestration tests.
 11. 2026-02-16: Phase 6 implementation completed: added `order/workers/reconciliation_worker.py` for leader-locked stale saga reconciliation and state-based recovery re-publish, integrated one-shot startup recovery hook into `order/workers/order_worker.py`, added `order/workers/dlq_replay_worker.py` for automatic DLQ draining with bounded replay attempts and `dlq.parking` quarantine routing, extended topology definitions (`shared_messaging/rabbitmq.py`, `helm-config/rabbitmq-definitions.json`), wired local/k8s deployments for new workers, and added Phase 6 unit coverage for reconciliation and replay flows.
+12. 2026-02-18: Phase 7 throughput-first tuning implementation started based on load-test bottlenecks: increased API/worker baseline replicas, raised worker prefetch baseline from 1 to 8, configured explicit Gunicorn concurrency, switched order service stock lookup to direct service DNS with gateway fallback, optimized checkout publish path to reuse per-thread RabbitMQ publisher connections (instead of per-request connect/declare/close), and tuned ingress defaults for higher connection fan-in. Added optional queue-depth worker autoscaling artifacts under `k8s-optional/keda/` plus worker `RABBITMQ_CONNECTION` env wiring for KEDA trigger integration. Phase 8 runbook publication started by adding versioned operational runbooks under `plans/runbooks/`.
+13. 2026-02-18: Phase 7 autoscaling integration updated: moved RabbitMQ queue-depth autoscaling manifests into `k8s/worker-keda-scaledobjects.yaml`, adjusted deployment startup baselines back to a single replica per API and worker deployment, and removed worker CPU HPAs to avoid conflicts with KEDA ownership of worker scale decisions. Updated chart deployment scripts to install KEDA before applying `k8s/` manifests.
+14. 2026-02-18: Phase 7 scaling issue discovered in live validation: KEDA ScaledObjects were not becoming ready due cross-namespace RabbitMQ DNS resolution failures (`lookup rabbitmq ... server misbehaving`) and stale worker CPU HPAs from prior applies. Decision: use fully qualified RabbitMQ host values for KEDA triggers and explicitly remove worker CPU HPAs in-cluster so queue-depth autoscaling can own worker scaling without controller conflicts.
+15. 2026-02-18: Phase 7 retuning for sustained checkout throughput and lower p95 latency under duplicate-heavy load: reduced KEDA queue targets to `3` with faster polling (`3s`) and worker min replicas `3`, raised API HPA floors and deployment baselines to `3` replicas, increased worker CPU requests/limits (`500m`/`1`), and raised Redis/RabbitMQ CPU headroom in Helm values. Decision: prioritize queue drain responsiveness and avoid single-pod baseline bottlenecks while preserving existing API contract and 2xx/4xx semantics.
+16. 2026-02-18: Checkout concurrency race fixed after live retest still showed ~2% duplicate-order failures and elevated tail latency. Issue observed: lock acquisition timeout path in `POST /checkout/{order_id}` could continue without lock ownership, allowing concurrent saga creation/publish races on the same order and excess Redis polling pressure. Decision: enforce lock-miss fallback to existing active saga wait (or immediate `400` if no active saga), and add adaptive checkout saga polling backoff to reduce Redis hot-loop load at high concurrency.

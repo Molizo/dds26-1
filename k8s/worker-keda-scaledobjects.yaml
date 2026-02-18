@@ -5,10 +5,10 @@ metadata:
 spec:
   scaleTargetRef:
     name: order-worker-deployment
-  pollingInterval: 3
-  cooldownPeriod: 60
-  minReplicaCount: 3
-  maxReplicaCount: 20
+  pollingInterval: 2
+  cooldownPeriod: 45
+  minReplicaCount: 4
+  maxReplicaCount: 24
   triggers:
     - type: rabbitmq
       metadata:
@@ -33,9 +33,9 @@ spec:
   scaleTargetRef:
     name: stock-worker-deployment
   pollingInterval: 3
-  cooldownPeriod: 60
-  minReplicaCount: 3
-  maxReplicaCount: 20
+  cooldownPeriod: 45
+  minReplicaCount: 2
+  maxReplicaCount: 16
   triggers:
     - type: rabbitmq
       metadata:
@@ -53,9 +53,9 @@ spec:
   scaleTargetRef:
     name: payment-worker-deployment
   pollingInterval: 3
-  cooldownPeriod: 60
-  minReplicaCount: 3
-  maxReplicaCount: 20
+  cooldownPeriod: 45
+  minReplicaCount: 2
+  maxReplicaCount: 16
   triggers:
     - type: rabbitmq
       metadata:

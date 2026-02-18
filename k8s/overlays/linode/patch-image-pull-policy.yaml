@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: order
+          imagePullPolicy: IfNotPresent
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stock-deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: stock
+          imagePullPolicy: IfNotPresent
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: user
+          imagePullPolicy: IfNotPresent
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-worker-deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: order-worker
+          imagePullPolicy: IfNotPresent
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stock-worker-deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: stock-worker
+          imagePullPolicy: IfNotPresent
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-worker-deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: payment-worker
+          imagePullPolicy: IfNotPresent
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-reconciliation-worker-deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: order-reconciliation-worker
+          imagePullPolicy: IfNotPresent
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dlq-replay-worker-deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: dlq-replay-worker
+          imagePullPolicy: IfNotPresent
+

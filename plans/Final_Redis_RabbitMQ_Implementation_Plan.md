@@ -130,6 +130,7 @@ Expected temporary state:
 2. Configure durable queues, retry queues, DLQs, and policies.
 3. Add worker deployment templates for order/stock/payment.
 4. Add baseline observability for queue depth and consumer health.
+5. In deployment automation, install ingress-nginx, wait for controller rollout readiness, and apply the shared ingress manifest explicitly.
 
 Expected temporary state:
 1. App still uses old checkout path.
@@ -219,6 +220,8 @@ Expected temporary state:
    - Keep topology declaration at connection bootstrap only.
 7. Increase ingress capacity defaults for high fan-in:
    - tune worker connections and upstream keepalive settings.
+8. In fresh-cluster deployment automation, gate manifest apply on KEDA CRD readiness:
+   - wait for `scaledobjects.keda.sh` and `triggerauthentications.keda.sh` CRDs to exist and become `Established` before applying `k8s/` manifests that include `ScaledObject` resources.
 
 Expected temporary state:
 1. Functional behavior stable; performance still being optimized.
@@ -266,6 +269,12 @@ Expected final state:
    - Existing API tests pass without endpoint changes.
 6. DLQ handling:
    - Poison message routes to DLQ and replay tool works safely.
+7. Fresh-cluster deployment ordering:
+   - Validate that a first-time deploy creates both `ScaledObject` and `Ingress` resources in a single run (no early apply abort due to missing KEDA CRDs).
+8. Ingress setup readiness:
+   - Validate that `nginx-ingress-nginx-controller` is rolled out and `ingress-service` exists after `linode-deploy-k8s.sh` completes.
+9. Load-test metric interpretation:
+   - Separate expected business rejections (`400` such as duplicate/already-paid checkout) from infrastructure failures when evaluating throughput/scaling changes.
 
 ## Out of Scope (Given Agreed Constraints)
 1. Database crash recovery design (explicitly out, because DB is assumed always available and stable).
@@ -326,3 +335,12 @@ Use this protocol whenever unexpected issues arise or implementation opinion cha
 14. 2026-02-18: Phase 7 scaling issue discovered in live validation: KEDA ScaledObjects were not becoming ready due cross-namespace RabbitMQ DNS resolution failures (`lookup rabbitmq ... server misbehaving`) and stale worker CPU HPAs from prior applies. Decision: use fully qualified RabbitMQ host values for KEDA triggers and explicitly remove worker CPU HPAs in-cluster so queue-depth autoscaling can own worker scaling without controller conflicts.
 15. 2026-02-18: Phase 7 retuning for sustained checkout throughput and lower p95 latency under duplicate-heavy load: reduced KEDA queue targets to `3` with faster polling (`3s`) and worker min replicas `3`, raised API HPA floors and deployment baselines to `3` replicas, increased worker CPU requests/limits (`500m`/`1`), and raised Redis/RabbitMQ CPU headroom in Helm values. Decision: prioritize queue drain responsiveness and avoid single-pod baseline bottlenecks while preserving existing API contract and 2xx/4xx semantics.
 16. 2026-02-18: Checkout concurrency race fixed after live retest still showed ~2% duplicate-order failures and elevated tail latency. Issue observed: lock acquisition timeout path in `POST /checkout/{order_id}` could continue without lock ownership, allowing concurrent saga creation/publish races on the same order and excess Redis polling pressure. Decision: enforce lock-miss fallback to existing active saga wait (or immediate `400` if no active saga), and add adaptive checkout saga polling backoff to reduce Redis hot-loop load at high concurrency.
+17. 2026-02-18: Added Linode deployment automation for cost-controlled cloud testing: introduced Terraform infrastructure under `terraform/linode/` for LKE provisioning and kubeconfig generation, added a Linode K8s overlay for cloud image pull behavior, and added Bash/PowerShell scripts for image publish, bring-up, deploy, and teardown with local `kubectl` context switch-and-restore. Decision: keep API contract unchanged while enabling fast create/destroy cycles for pay-only-when-active development; use script-driven existing LCR endpoint inputs because current Linode Terraform provider does not expose an LCR resource.
+18. 2026-02-18: Linode deployment automation narrowed to Bash-only scripts and EU defaults per workflow preference: removed PowerShell script variants and switched default Terraform region/example registry values to Amsterdam (`nl-ams`, `nl-ams-1.linodeobjects.com`) for proximity and consistency.
+19. 2026-02-18: Linode image distribution approach changed after repeated `ImagePullBackOff` and registry push inconsistencies in live cluster runs. Decision: drop LCR support from the Linode helper flow and standardize on `ttl.sh` `:24h` images for order/stock/user by default, with optional explicit image overrides. Rationale: faster, deterministic bring-up/teardown for active development sessions with lower operational friction, while preserving the external API contract and benchmark semantics.
+20. 2026-02-18: Live cluster resource pressure still caused widespread scheduling backlog with replica floors set to `3` (`Insufficient cpu`). Decision: lower baseline deployment replicas, API HPA `minReplicas`, and worker KEDA `minReplicaCount` from `3` to `2` so minimum pod count is capped at two while preserving autoscaling behavior.
+21. 2026-02-18: Redis remained Pending in Linode validation after scaling changes because chart requests were unschedulable on `g6-standard-2` nodes (`requests.cpu=2`, `requests.memory=4Gi` per pod). Decision: reduce Redis master/replica requests to `500m` CPU and `512Mi` memory with `1Gi/1` limits in `helm-config/redis-helm-values.yaml` so persistent Redis pods can schedule in the same dev cluster footprint.
+22. 2026-02-18: CPU utilization in HPAs showed as unknown on Linode due missing `metrics.k8s.io` API in fresh clusters. Decision: include `metrics-server` in `scripts/linode-deploy-k8s.sh` and add `helm-config/metrics-server-helm-values.yaml` with kubelet TLS/address compatibility flags so `kubectl top` and CPU-based HPA metrics work out-of-the-box.
+23. 2026-02-18: Fresh Linode cluster deploy could finish without Ingress because `scripts/linode-deploy-k8s.sh` installed KEDA and immediately applied all `k8s` manifests, allowing first-run timing where `ScaledObject` apply fails before KEDA CRDs are registered and the apply stream aborts before `Ingress` creation. Decision: add explicit CRD readiness waits for `scaledobjects.keda.sh` and `triggerauthentications.keda.sh` before the kustomize/apply step. Rationale: preserve deterministic one-pass bring-up and avoid partial app-manifest application on new clusters.
+24. 2026-02-18: Ingress setup moved to an explicit deployment step in `scripts/linode-deploy-k8s.sh`: after Helm install, wait for `nginx-ingress-nginx-controller` rollout and apply `k8s/ingress-service.yaml` directly. Decision: make ingress provisioning deterministic even when broader manifest batches later fail for unrelated reasons; preserve external API routing contract and existing path semantics.
+25. 2026-02-18: Phase 7 live retuning for 10k-user runs with high duplicate-checkout traffic: increased order API HPA headroom (`minReplicas=6`, `maxReplicas=45`) with faster scale-up and slower scale-down behavior, set order worker KEDA to `minReplicaCount=4`, `maxReplicaCount=24`, `pollingInterval=2`, `cooldownPeriod=45`, and reduced stock/payment worker ceilings (`maxReplicaCount=16`) with `cooldownPeriod=45`; set ingress controller baseline replicas to `2`. Decision: keep API/ingress headroom for high request fan-in while avoiding over-scaling workers for fast-failing business `400` requests that do not produce sustained queue backlog.

@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - dlq-replay-worker.yaml
+  - hpa.yaml
+  - ingress-service.yaml
+  - order-app.yaml
+  - order-reconciliation-worker.yaml
+  - order-worker.yaml
+  - payment-worker.yaml
+  - stock-app.yaml
+  - stock-worker.yaml
+  - user-app.yaml
+  - worker-keda-scaledobjects.yaml
+

@@ -3,7 +3,7 @@ kind: Deployment
 metadata:
   name: order-worker-deployment
 spec:
-  replicas: 3
+  replicas: 2
   selector:
     matchLabels:
       component: order-worker

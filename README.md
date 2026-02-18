@@ -52,6 +52,38 @@ Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in
 
 ***Requirements:*** You need to have access to kubectl of a k8s cluster.
 
+#### Linode LKE with Terraform (easy create/teardown)
+
+This project now includes a Linode-focused Terraform stack under `terraform/linode` plus helper scripts under `scripts/` for:
+- image build/push to `ttl.sh` (`:24h` tags),
+- LKE creation,
+- Helm dependency installation,
+- app deployment rollout,
+- full destroy with local `kubectl` context restore.
+
+One-time setup:
+1. Copy `terraform/linode/terraform.tfvars.example` to `terraform/linode/terraform.tfvars` and adjust non-secret defaults.
+
+Required environment variables:
+- `LINODE_TOKEN`
+- Optional: `IMAGE_TAG` (defaults to `24h`)
+- Optional image overrides:
+  - `ORDER_IMAGE`
+  - `STOCK_IMAGE`
+  - `USER_IMAGE`
+
+Bash workflow:
+```bash
+bash scripts/linode-up.sh
+bash scripts/linode-down.sh
+```
+
+Notes:
+- `linode-up` saves your previous `kubectl` context and switches to `dds26-linode` by default.
+- `linode-down` destroys cloud resources and restores the previous local context.
+- Set `CLEAN_LINODE_CONTEXT=true` if you also want teardown scripts to delete the Linode context alias.
+- Linode deploy flow installs `metrics-server` so CPU-based HPA metrics are available (`kubectl top`, `cpu: x%/70%`).
+
 ### Phase 3 migration note (2026-02-16)
 
 - Stock and payment persistence migrated from msgpack blobs (`<id>`) to Redis hashes:

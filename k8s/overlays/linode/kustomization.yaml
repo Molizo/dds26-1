@@ -1,0 +1,29 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../../k8s/dlq-replay-worker.yaml
+  - ../../../k8s/hpa.yaml
+  - ../../../k8s/ingress-service.yaml
+  - ../../../k8s/order-app.yaml
+  - ../../../k8s/order-reconciliation-worker.yaml
+  - ../../../k8s/order-worker.yaml
+  - ../../../k8s/payment-worker.yaml
+  - ../../../k8s/stock-app.yaml
+  - ../../../k8s/stock-worker.yaml
+  - ../../../k8s/user-app.yaml
+  - ../../../k8s/worker-keda-scaledobjects.yaml
+
+patches:
+  - path: patch-image-pull-policy.yaml
+
+images:
+  - name: order
+    newName: ttl.sh/dds26-order
+    newTag: 24h
+  - name: stock
+    newName: ttl.sh/dds26-stock
+    newTag: 24h
+  - name: user
+    newName: ttl.sh/dds26-user
+    newTag: 24h

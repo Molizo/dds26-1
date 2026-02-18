@@ -12,6 +12,8 @@ cd "${ROOT_DIR}"
 
 minikube start
 minikube addons enable ingress
+minikube addons enable metrics-server
+kubectl -n kube-system rollout status deployment/metrics-server --timeout=180s
 
 minikube image build -t order:latest -f order/Dockerfile .
 minikube image build -t stock:latest -f stock/Dockerfile .

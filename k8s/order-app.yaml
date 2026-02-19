@@ -27,7 +27,7 @@ spec:
     spec:
       containers:
         - name: order
-          image: order:latest
+          image: ttl.sh/dds26-1-order:24h
           resources:
             limits:
               memory: "1Gi"
@@ -40,6 +40,8 @@ spec:
           ports:
             - containerPort: 5000
           env:
+            - name: GATEWAY_URL
+              value: "http://nginx-ingress-nginx-controller:80"
             - name: USER_SERVICE_URL
               value: "user-service"
             - name: STOCK_SERVICE_URL

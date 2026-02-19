@@ -27,7 +27,7 @@ spec:
     spec:
       containers:
         - name: stock
-          image: stock:latest
+          image: ttl.sh/dds26-1-stock:24h
           resources:
             limits:
               memory: "1Gi"

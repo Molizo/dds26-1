@@ -1,147 +1,270 @@
+import concurrent.futures
+import threading
 import unittest
+import uuid
 
 import utils as tu
 
 
-class TestMicroservices(unittest.TestCase):
+class TestCheckoutRegression(unittest.TestCase):
 
-    def test_stock(self):
-        # Test /stock/item/create/<price>
-        item: dict = tu.create_item(5)
-        self.assertIn('item_id', item)
+    @classmethod
+    def setUpClass(cls):
+        tu.wait_for_gateway()
 
-        item_id: str = item['item_id']
+    def test_checkout_happy_path_commits_once(self):
+        user = tu.create_user_with_credit(100)
+        user_id = user["user_id"]
 
-        # Test /stock/find/<item_id>
-        item: dict = tu.find_item(item_id)
-        self.assertEqual(item['price'], 5)
-        self.assertEqual(item['stock'], 0)
+        item_1 = tu.create_item_with_stock(price=4, stock=10)
+        item_2 = tu.create_item_with_stock(price=6, stock=10)
 
-        # Test /stock/add/<item_id>/<number>
-        add_stock_response = tu.add_stock(item_id, 50)
-        self.assertTrue(200 <= int(add_stock_response) < 300)
+        order = tu.create_order_with_lines(
+            user_id,
+            [
+                (item_1["item_id"], 2),
+                (item_2["item_id"], 1),
+            ],
+        )
+        order_id = order["order_id"]
 
-        stock_after_add: int = tu.find_item(item_id)['stock']
-        self.assertEqual(stock_after_add, 50)
+        response = tu.checkout(order_id)
+        tu.assert_success(response)
 
-        # Test /stock/subtract/<item_id>/<number>
-        over_subtract_stock_response = tu.subtract_stock(item_id, 200)
-        self.assertTrue(tu.status_code_is_failure(int(over_subtract_stock_response)))
+        order_state = tu.get_order_state(order_id)
+        self.assertTrue(order_state["paid"])
+        self.assertEqual(order_state["total_cost"], 14)
 
-        subtract_stock_response = tu.subtract_stock(item_id, 15)
-        self.assertTrue(tu.status_code_is_success(int(subtract_stock_response)))
+        self.assertEqual(tu.find_item(item_1["item_id"])["stock"], 8)
+        self.assertEqual(tu.find_item(item_2["item_id"])["stock"], 9)
+        self.assertEqual(tu.find_user(user_id)["credit"], 86)
 
-        stock_after_subtract: int = tu.find_item(item_id)['stock']
-        self.assertEqual(stock_after_subtract, 35)
+    def test_checkout_out_of_stock_rolls_back_all_items(self):
+        user = tu.create_user_with_credit(100)
+        user_id = user["user_id"]
 
-    def test_payment(self):
-        # Test /payment/pay/<user_id>/<order_id>
-        user: dict = tu.create_user()
-        self.assertIn('user_id', user)
+        item_1 = tu.create_item_with_stock(price=5, stock=5)
+        item_2 = tu.create_item_with_stock(price=3, stock=0)
 
-        user_id: str = user['user_id']
+        order = tu.create_order_with_lines(
+            user_id,
+            [
+                (item_1["item_id"], 2),
+                (item_2["item_id"], 1),
+            ],
+        )
+        order_id = order["order_id"]
 
-        # Test /users/credit/add/<user_id>/<amount>
-        add_credit_response = tu.add_credit_to_user(user_id, 15)
-        self.assertTrue(tu.status_code_is_success(add_credit_response))
+        initial_credit = tu.find_user(user_id)["credit"]
+        initial_stock_1 = tu.find_item(item_1["item_id"])["stock"]
+        initial_stock_2 = tu.find_item(item_2["item_id"])["stock"]
 
-        # add item to the stock service
-        item: dict = tu.create_item(5)
-        self.assertIn('item_id', item)
+        response = tu.checkout(order_id)
+        tu.assert_failure(response)
 
-        item_id: str = item['item_id']
+        self.assertEqual(tu.find_item(item_1["item_id"])["stock"], initial_stock_1)
+        self.assertEqual(tu.find_item(item_2["item_id"])["stock"], initial_stock_2)
+        self.assertEqual(tu.find_user(user_id)["credit"], initial_credit)
+        self.assertFalse(tu.get_order_state(order_id)["paid"])
 
-        add_stock_response = tu.add_stock(item_id, 50)
-        self.assertTrue(tu.status_code_is_success(add_stock_response))
+    def test_checkout_insufficient_credit_rolls_back_stock(self):
+        user = tu.create_user_with_credit(4)
+        user_id = user["user_id"]
 
-        # create order in the order service and add item to the order
-        order: dict = tu.create_order(user_id)
-        self.assertIn('order_id', order)
+        item_1 = tu.create_item_with_stock(price=3, stock=20)
+        item_2 = tu.create_item_with_stock(price=2, stock=20)
 
-        order_id: str = order['order_id']
+        order = tu.create_order_with_lines(
+            user_id,
+            [
+                (item_1["item_id"], 2),
+                (item_2["item_id"], 2),
+            ],
+        )
+        order_id = order["order_id"]
 
-        add_item_response = tu.add_item_to_order(order_id, item_id, 1)
-        self.assertTrue(tu.status_code_is_success(add_item_response))
+        initial_credit = tu.find_user(user_id)["credit"]
+        initial_stock_1 = tu.find_item(item_1["item_id"])["stock"]
+        initial_stock_2 = tu.find_item(item_2["item_id"])["stock"]
 
-        add_item_response = tu.add_item_to_order(order_id, item_id, 1)
-        self.assertTrue(tu.status_code_is_success(add_item_response))
-        add_item_response = tu.add_item_to_order(order_id, item_id, 1)
-        self.assertTrue(tu.status_code_is_success(add_item_response))
+        response = tu.checkout(order_id)
+        tu.assert_failure(response)
 
-        payment_response = tu.payment_pay(user_id, 10)
-        self.assertTrue(tu.status_code_is_success(payment_response))
+        self.assertEqual(tu.find_item(item_1["item_id"])["stock"], initial_stock_1)
+        self.assertEqual(tu.find_item(item_2["item_id"])["stock"], initial_stock_2)
+        self.assertEqual(tu.find_user(user_id)["credit"], initial_credit)
+        self.assertFalse(tu.get_order_state(order_id)["paid"])
 
-        credit_after_payment: int = tu.find_user(user_id)['credit']
-        self.assertEqual(credit_after_payment, 5)
+    def test_add_non_existing_item_fails_without_order_change(self):
+        user = tu.create_user()
+        order = tu.create_order(user["user_id"])
 
-    def test_order(self):
-        # Test /payment/pay/<user_id>/<order_id>
-        user: dict = tu.create_user()
-        self.assertIn('user_id', user)
+        order_id = order["order_id"]
+        order_before = tu.get_order_state(order_id)
+        missing_item_id = str(uuid.uuid4())
 
-        user_id: str = user['user_id']
+        response_code = tu.add_item_to_order(order_id, missing_item_id, 1)
+        tu.assert_failure(response_code)
 
-        # create order in the order service and add item to the order
-        order: dict = tu.create_order(user_id)
-        self.assertIn('order_id', order)
+        order_after = tu.get_order_state(order_id)
+        self.assertEqual(order_after["items"], order_before["items"])
+        self.assertEqual(order_after["total_cost"], order_before["total_cost"])
 
-        order_id: str = order['order_id']
+    def test_checkout_invalid_order_id_has_no_side_effects(self):
+        user = tu.create_user_with_credit(11)
+        user_id = user["user_id"]
 
-        # add item to the stock service
-        item1: dict = tu.create_item(5)
-        self.assertIn('item_id', item1)
-        item_id1: str = item1['item_id']
-        add_stock_response = tu.add_stock(item_id1, 15)
-        self.assertTrue(tu.status_code_is_success(add_stock_response))
+        item = tu.create_item_with_stock(price=5, stock=7)
+        item_id = item["item_id"]
 
-        # add item to the stock service
-        item2: dict = tu.create_item(5)
-        self.assertIn('item_id', item2)
-        item_id2: str = item2['item_id']
-        add_stock_response = tu.add_stock(item_id2, 1)
-        self.assertTrue(tu.status_code_is_success(add_stock_response))
+        initial_credit = tu.find_user(user_id)["credit"]
+        initial_stock = tu.find_item(item_id)["stock"]
 
-        add_item_response = tu.add_item_to_order(order_id, item_id1, 1)
-        self.assertTrue(tu.status_code_is_success(add_item_response))
-        add_item_response = tu.add_item_to_order(order_id, item_id2, 1)
-        self.assertTrue(tu.status_code_is_success(add_item_response))
-        subtract_stock_response = tu.subtract_stock(item_id2, 1)
-        self.assertTrue(tu.status_code_is_success(subtract_stock_response))
+        response = tu.checkout(str(uuid.uuid4()))
+        tu.assert_failure(response)
 
-        checkout_response = tu.checkout_order(order_id).status_code
-        self.assertTrue(tu.status_code_is_failure(checkout_response))
+        self.assertEqual(tu.find_user(user_id)["credit"], initial_credit)
+        self.assertEqual(tu.find_item(item_id)["stock"], initial_stock)
 
-        stock_after_subtract: int = tu.find_item(item_id1)['stock']
-        self.assertEqual(stock_after_subtract, 15)
+    def test_duplicate_checkout_attempt_has_no_second_commit(self):
+        user = tu.create_user_with_credit(20)
+        user_id = user["user_id"]
 
-        add_stock_response = tu.add_stock(item_id2, 15)
-        self.assertTrue(tu.status_code_is_success(int(add_stock_response)))
+        item = tu.create_item_with_stock(price=5, stock=4)
+        item_id = item["item_id"]
 
-        credit_after_payment: int = tu.find_user(user_id)['credit']
-        self.assertEqual(credit_after_payment, 0)
+        order = tu.create_order_with_lines(user_id, [(item_id, 2)])
+        order_id = order["order_id"]
 
-        checkout_response = tu.checkout_order(order_id).status_code
-        self.assertTrue(tu.status_code_is_failure(checkout_response))
+        first_response = tu.checkout(order_id)
+        tu.assert_success(first_response)
 
-        add_credit_response = tu.add_credit_to_user(user_id, 15)
-        self.assertTrue(tu.status_code_is_success(int(add_credit_response)))
+        stock_before_second = tu.find_item(item_id)["stock"]
+        credit_before_second = tu.find_user(user_id)["credit"]
 
-        credit: int = tu.find_user(user_id)['credit']
-        self.assertEqual(credit, 15)
+        second_response = tu.checkout(order_id)
+        second_status = second_response.status_code
+        if tu.status_code_is_success(second_status):
+            self.assertEqual(tu.find_item(item_id)["stock"], stock_before_second)
+            self.assertEqual(tu.find_user(user_id)["credit"], credit_before_second)
+        else:
+            tu.assert_failure(second_response)
+            self.assertEqual(tu.find_item(item_id)["stock"], stock_before_second)
+            self.assertEqual(tu.find_user(user_id)["credit"], credit_before_second)
 
-        stock: int = tu.find_item(item_id1)['stock']
-        self.assertEqual(stock, 15)
+    def test_repeated_same_item_lines_are_aggregated(self):
+        user = tu.create_user_with_credit(100)
+        user_id = user["user_id"]
 
-        checkout_response = tu.checkout_order(order_id)
-        print(checkout_response.text)
-        self.assertTrue(tu.status_code_is_success(checkout_response.status_code))
+        item = tu.create_item_with_stock(price=4, stock=20)
+        item_id = item["item_id"]
 
-        stock_after_subtract: int = tu.find_item(item_id1)['stock']
-        self.assertEqual(stock_after_subtract, 14)
+        order = tu.create_order_with_lines(
+            user_id,
+            [
+                (item_id, 1),
+                (item_id, 2),
+                (item_id, 3),
+            ],
+        )
+        order_id = order["order_id"]
 
-        credit: int = tu.find_user(user_id)['credit']
-        self.assertEqual(credit, 5)
+        response = tu.checkout(order_id)
+        tu.assert_success(response)
+
+        order_state = tu.get_order_state(order_id)
+        self.assertEqual(order_state["total_cost"], 24)
+        self.assertEqual(tu.find_item(item_id)["stock"], 14)
+        self.assertEqual(tu.find_user(user_id)["credit"], 76)
+
+    def test_concurrent_inverse_item_order_contention_has_no_deadlock(self):
+        user_1 = tu.create_user_with_credit(10)
+        user_2 = tu.create_user_with_credit(10)
+
+        item_a = tu.create_item_with_stock(price=2, stock=1)
+        item_b = tu.create_item_with_stock(price=3, stock=1)
+
+        order_1 = tu.create_order_with_lines(
+            user_1["user_id"],
+            [
+                (item_a["item_id"], 1),
+                (item_b["item_id"], 1),
+            ],
+        )
+        order_2 = tu.create_order_with_lines(
+            user_2["user_id"],
+            [
+                (item_b["item_id"], 1),
+                (item_a["item_id"], 1),
+            ],
+        )
+
+        barrier = threading.Barrier(2)
+
+        def run_checkout(order_id: str) -> int:
+            barrier.wait()
+            return tu.checkout(order_id).status_code
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            future_1 = pool.submit(run_checkout, order_1["order_id"])
+            future_2 = pool.submit(run_checkout, order_2["order_id"])
+            status_1 = future_1.result(timeout=8)
+            status_2 = future_2.result(timeout=8)
+
+        self.assertTrue(tu.status_code_is_success(status_1) or tu.status_code_is_failure(status_1))
+        self.assertTrue(tu.status_code_is_success(status_2) or tu.status_code_is_failure(status_2))
+
+        success_count = sum(
+            1 for status in [status_1, status_2] if tu.status_code_is_success(status)
+        )
+        self.assertLessEqual(success_count, 1)
+
+        final_item_a_stock = tu.find_item(item_a["item_id"])["stock"]
+        final_item_b_stock = tu.find_item(item_b["item_id"])["stock"]
+        self.assertEqual(final_item_a_stock, 1 - success_count)
+        self.assertEqual(final_item_b_stock, 1 - success_count)
+
+        total_credit = tu.find_user(user_1["user_id"])["credit"] + tu.find_user(user_2["user_id"])["credit"]
+        self.assertEqual(total_credit, 20 - (5 * success_count))
+
+        paid_count = sum(
+            [
+                1 if tu.get_order_state(order_1["order_id"])["paid"] else 0,
+                1 if tu.get_order_state(order_2["order_id"])["paid"] else 0,
+            ]
+        )
+        self.assertEqual(paid_count, success_count)
+
+    def test_concurrent_checkout_same_order_has_single_logical_commit(self):
+        user = tu.create_user_with_credit(7)
+        user_id = user["user_id"]
+
+        item = tu.create_item_with_stock(price=7, stock=1)
+        item_id = item["item_id"]
+
+        order = tu.create_order_with_lines(user_id, [(item_id, 1)])
+        order_id = order["order_id"]
+
+        barrier = threading.Barrier(2)
+
+        def run_checkout() -> int:
+            barrier.wait()
+            return tu.checkout(order_id).status_code
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(run_checkout) for _ in range(2)]
+            statuses = [future.result() for future in futures]
+
+        success_count = sum(1 for status in statuses if tu.status_code_is_success(status))
+        failure_count = sum(1 for status in statuses if tu.status_code_is_failure(status))
+
+        self.assertEqual(success_count, 1)
+        self.assertEqual(failure_count, 1)
+
+        self.assertEqual(tu.find_user(user_id)["credit"], 0)
+        self.assertEqual(tu.find_item(item_id)["stock"], 0)
+        self.assertTrue(tu.get_order_state(order_id)["paid"])
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

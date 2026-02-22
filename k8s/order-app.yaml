@@ -42,10 +42,10 @@ spec:
           env:
             - name: GATEWAY_URL
               value: "http://nginx-ingress-nginx-controller:80"
-            - name: USER_SERVICE_URL
-              value: "user-service"
-            - name: STOCK_SERVICE_URL
-              value: "stock-service"
+            - name: PAYMENT_INTERNAL_URL
+              value: "http://user-service:5000"
+            - name: STOCK_INTERNAL_URL
+              value: "http://stock-service:5000"
             - name: REDIS_HOST
               value: redis-master
             - name: REDIS_PORT

@@ -17,6 +17,8 @@ services:
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
+      - PAYMENT_INTERNAL_URL=http://payment-service:5000
+      - STOCK_INTERNAL_URL=http://stock-service:5000
       - CHECKOUT_PROTOCOL=${CHECKOUT_PROTOCOL:-saga}
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:

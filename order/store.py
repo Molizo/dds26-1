@@ -3,7 +3,7 @@ from flask import abort
 from msgspec import msgpack
 import uuid
 
-from common.redis_lock import acquire_lock, release_lock
+from common.redis_lock import acquire_lock, release_lock, renew_lock
 from common.time_utils import now_ms
 from config import (
     CHECKOUT_PROTOCOL,
@@ -163,6 +163,13 @@ def acquire_checkout_lock(order_id: str) -> str | None:
 def release_checkout_lock(order_id: str, token: str):
     try:
         release_lock(db, lock_key(order_id), token)
+    except redis.exceptions.RedisError:
+        abort(400, DB_ERROR_STR)
+
+
+def renew_checkout_lock(order_id: str, token: str) -> bool:
+    try:
+        return renew_lock(db, lock_key(order_id), token, ORDER_LOCK_TTL_SECONDS)
     except redis.exceptions.RedisError:
         abort(400, DB_ERROR_STR)
 

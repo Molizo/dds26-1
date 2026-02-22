@@ -1,4 +1,5 @@
 import random
+import time
 import uuid
 
 import redis
@@ -6,7 +7,13 @@ from flask import Blueprint, Response, abort, current_app, jsonify
 from msgspec import msgpack
 
 from clients import send_get_request
-from config import CHECKOUT_PROTOCOL, DB_ERROR_STR, GATEWAY_URL
+from config import (
+    CHECKOUT_PROTOCOL,
+    DB_ERROR_STR,
+    GATEWAY_URL,
+    REQUEST_HEALING_BUDGET_SECONDS,
+    REQUEST_HEALING_RETRY_INTERVAL_SECONDS,
+)
 from flows.fence_recovery import recover_fenced_2pc_commit
 from flows.saga import run_saga_checkout
 from flows.two_pc import run_2pc_checkout
@@ -21,10 +28,10 @@ from store import (
     get_active_tx,
     get_order_from_db,
     has_commit_fence,
-    has_recent_checkout,
     is_terminal_status,
     mark_recent_checkout,
     release_checkout_lock,
+    renew_checkout_lock,
     save_tx,
     set_active_tx,
 )
@@ -125,9 +132,21 @@ def checkout(order_id: str):
 
     tx_entry: CheckoutTxValue | None = None
     try:
+        def ensure_checkout_lock_held():
+            if not renew_checkout_lock(order_id, lock_token):
+                abort(409, f"Checkout already in progress for order: {order_id}")
+
         order_entry = get_order_from_db(order_id)
         if not order_entry.paid and has_commit_fence(order_id):
+            deadline = time.monotonic() + REQUEST_HEALING_BUDGET_SECONDS
+            ensure_checkout_lock_held()
             recovery_outcome = recover_fenced_2pc_commit(order_id, order_entry)
+            while recovery_outcome == "blocked" and time.monotonic() < deadline:
+                ensure_checkout_lock_held()
+                time.sleep(REQUEST_HEALING_RETRY_INTERVAL_SECONDS)
+                ensure_checkout_lock_held()
+                order_entry = get_order_from_db(order_id)
+                recovery_outcome = recover_fenced_2pc_commit(order_id, order_entry)
             if recovery_outcome == "finalized":
                 mark_recent_checkout(order_id)
                 return Response("Order finalized from pending 2PC commit", status=200)
@@ -138,8 +157,6 @@ def checkout(order_id: str):
         if order_entry.paid:
             if has_commit_fence(order_id):
                 clear_commit_fence(order_id)
-            if has_recent_checkout(order_id):
-                abort(409, f"Checkout already completed for order: {order_id}")
             return Response("Order already paid", status=200)
 
         active_tx = get_active_tx(order_id)

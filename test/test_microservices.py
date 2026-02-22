@@ -220,14 +220,9 @@ class TestCheckoutRegression(unittest.TestCase):
         credit_before_second = tu.find_user(user_id)["credit"]
 
         second_response = tu.checkout(order_id)
-        second_status = second_response.status_code
-        if tu.status_code_is_success(second_status):
-            self.assertEqual(tu.find_item(item_id)["stock"], stock_before_second)
-            self.assertEqual(tu.find_user(user_id)["credit"], credit_before_second)
-        else:
-            tu.assert_failure(second_response)
-            self.assertEqual(tu.find_item(item_id)["stock"], stock_before_second)
-            self.assertEqual(tu.find_user(user_id)["credit"], credit_before_second)
+        tu.assert_success(second_response)
+        self.assertEqual(tu.find_item(item_id)["stock"], stock_before_second)
+        self.assertEqual(tu.find_user(user_id)["credit"], credit_before_second)
 
     def test_repeated_same_item_lines_are_aggregated(self):
         user = tu.create_user_with_credit(100)
@@ -335,8 +330,9 @@ class TestCheckoutRegression(unittest.TestCase):
         success_count = sum(1 for status in statuses if tu.status_code_is_success(status))
         failure_count = sum(1 for status in statuses if tu.status_code_is_failure(status))
 
-        self.assertEqual(success_count, 1)
-        self.assertEqual(failure_count, 1)
+        self.assertGreaterEqual(success_count, 1)
+        self.assertLessEqual(success_count, 2)
+        self.assertIn(failure_count, [0, 1])
 
         self.assertEqual(tu.find_user(user_id)["credit"], 0)
         self.assertEqual(tu.find_item(item_id)["stock"], 0)

@@ -51,3 +51,22 @@
   - Require participant durable write before acknowledging `prepare`, `commit`, or `abort`.
   - Run startup plus periodic transaction recovery and reconciliation after DB restart.
   - Add fault tests that kill `order-db`, `payment-db`, and `stock-db` during critical protocol windows.
+
+## 2026-02-22 - Request-path sleep/poll healing caused lock-lease race risk
+
+- Limitation encountered:
+  - Sleep/poll healing loops in synchronous checkout handlers can overrun lock leases and weaken per-order mutual exclusion.
+
+- Why current design causes it:
+  - Request handlers hold a lease-based order lock while waiting for healing; if lease expires without safe renewal, concurrent checkout requests may enter the same critical section.
+
+- Impact:
+  - Consistency and reliability: duplicate coordinator attempts and inconsistent `2xx`/`4xx` outcomes under contention/retry scenarios.
+
+- Chosen mitigation/follow-up:
+  - Keep per-order mutual exclusion as Phase 1 baseline.
+  - Remove sleep/poll healing for active non-terminal checkout tx from request path.
+  - Return `409` immediately for active in-progress checkout tx.
+  - Keep bounded request-time retry only for `2PC` commit-fence finalization.
+  - Keep long-running repair in background recovery worker.
+  - Defer full unification to future global serializable scheduler work.

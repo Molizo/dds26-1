@@ -246,4 +246,3 @@ def internal_abort_subtract_handler(tx_id: str, item_id: str):
     if result == "MISMATCH":
         abort(400, f"Transaction protocol mismatch for tx_id: {tx_id}")
     abort(400, f"2PC stock invalid state for tx_id: {tx_id}")
-

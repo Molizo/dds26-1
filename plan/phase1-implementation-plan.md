@@ -23,7 +23,9 @@ Primary optimization target is checkout correctness and resilience under failure
 8. Consistency priority: consistency first over performance.
 9. Recovery target: eventual stabilization within minutes after failure.
 10. Duplicate checkout behavior: idempotent `200` no-op if already paid.
-11. Request-time healing budget: block/retry up to 30s, then fail `4xx`; background recovery continues.
+11. Request-time healing scope: only `2PC` commit-fence finalization may block/retry up to 30s.
+12. Active in-progress checkout policy: return `409` immediately; do not sleep/retry or force recovery in request path.
+13. Long-term serialization strategy: keep Phase 1 per-order locking; move to global serializable scheduling in a later phase.
 
 ## Scope (Phase 1 Only)
 
@@ -251,7 +253,8 @@ Tasks:
 
 - On service startup, scan non-terminal tx records and resume.
 - Add periodic recovery scan loop.
-- For request path: block/retry up to 30s, then return `4xx` if still non-terminal.
+- For request path: allow bounded block/retry only for `2PC` commit-fence finalization.
+- For request path: return `409` immediately when an active non-terminal checkout tx already exists.
 - Continue background recovery until terminal consistency.
 
 Acceptance criteria:
@@ -265,15 +268,17 @@ Guidelines:
 - Exponential backoff with jitter for recovery retries.
 - Run the recovery worker inside `order-service`; no separate container type is required for Phase 1.
 - If multiple `order-service` replicas are running, enforce single-active recovery execution using a distributed leader lock (for example Redis lock with lease and renewal).
+- Avoid sleep-based healing loops for active non-terminal checkout txs in request handlers; this reduces lock-lease race risk and keeps mutual exclusion simple.
 
 ## Database failure handling strategy
 
 Request-time behavior:
 
 1. If a Redis operation fails during checkout, treat that step as unknown or incomplete, never as committed success.
-2. Attempt bounded inline healing and retries for up to 30 seconds.
-3. If unresolved after 30 seconds, return `4xx` and persist or re-persist tx state as `FAILED_NEEDS_RECOVERY` at first available durable write.
-4. Continue recovery asynchronously until terminal tx state is reached.
+2. If `2PC` commit fence is present, attempt bounded inline finalization retries for up to 30 seconds.
+3. If an active non-terminal checkout tx exists, return `409` immediately instead of sleeping/polling.
+4. If unresolved after bounded fence finalization, return `4xx` and persist or re-persist tx state as `FAILED_NEEDS_RECOVERY` at first available durable write.
+5. Continue recovery asynchronously until terminal tx state is reached.
 
 Participant durability rules:
 
@@ -438,6 +443,20 @@ App-level 2PC:
 3. Internal protocol endpoints are not part of external API contract.
 4. Single-container failures are primary fault model for Phase 1.
 5. Container failures include both service containers and Redis database containers.
-6. Checkout request blocks up to 30s attempting stabilization, then returns `4xx` if unresolved.
+6. Checkout request may block up to 30s only for `2PC` commit-fence finalization; active in-progress checkout returns `409` immediately.
 7. Recovery continues asynchronously after request failure until terminal state.
 8. Recovery worker is embedded in `order-service`; with multiple order replicas, only one instance may hold the recovery leader lock at a time.
+
+## Future Serialization Roadmap
+
+This Phase 1 design keeps per-order mutual exclusion because checkout still performs distributed side effects (`stock`, `payment`, `order`) without a global scheduler.
+
+- Why mutual exclusion remains in Phase 1:
+  - Prevents two concurrent checkout coordinations for the same order from racing through non-atomic side effects.
+  - Preserves single-logical-commit behavior under retries and partial failures.
+- Why request-time sleep/poll is avoided for active tx:
+  - It adds lock-lease race risk and complexity in synchronous request handlers.
+  - Background recovery is a safer place to perform long-running healing.
+- Planned Phase 2+ direction:
+  - Introduce a global serializable scheduler/orchestrator that can centralize ordering/serialization.
+  - Replace ad-hoc per-order request-path coordination with scheduler-driven commit ordering.

@@ -15,4 +15,3 @@ REDIS_HOST = os.environ["REDIS_HOST"]
 REDIS_PORT = int(os.environ["REDIS_PORT"])
 REDIS_PASSWORD = os.environ["REDIS_PASSWORD"]
 REDIS_DB = int(os.environ["REDIS_DB"])
-

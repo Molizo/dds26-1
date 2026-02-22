@@ -1,5 +1,6 @@
 import concurrent.futures
 import threading
+import time
 import unittest
 import uuid
 
@@ -110,6 +111,68 @@ class TestCheckoutRegression(unittest.TestCase):
         self.assertEqual(order_after["items"], order_before["items"])
         self.assertEqual(order_after["total_cost"], order_before["total_cost"])
 
+    def test_add_item_negative_quantity_rejected_no_state_change(self):
+        user = tu.create_user()
+        order = tu.create_order(user["user_id"])
+        order_id = order["order_id"]
+
+        item = tu.create_item_with_stock(price=4, stock=10)
+        item_id = item["item_id"]
+
+        order_before = tu.get_order_state(order_id)
+
+        response_code = tu.add_item_to_order(order_id, item_id, -1)
+        tu.assert_failure(response_code)
+
+        order_after = tu.get_order_state(order_id)
+        self.assertEqual(order_after["items"], order_before["items"])
+        self.assertEqual(order_after["total_cost"], order_before["total_cost"])
+
+    def test_stock_add_negative_amount_rejected(self):
+        item = tu.create_item_with_stock(price=5, stock=6)
+        item_id = item["item_id"]
+
+        stock_before = tu.find_item(item_id)["stock"]
+        response_code = tu.add_stock(item_id, -2)
+        tu.assert_failure(response_code)
+        self.assertEqual(tu.find_item(item_id)["stock"], stock_before)
+
+    def test_stock_subtract_negative_amount_rejected(self):
+        item = tu.create_item_with_stock(price=5, stock=6)
+        item_id = item["item_id"]
+
+        stock_before = tu.find_item(item_id)["stock"]
+        response_code = tu.subtract_stock(item_id, -2)
+        tu.assert_failure(response_code)
+        self.assertEqual(tu.find_item(item_id)["stock"], stock_before)
+
+    def test_payment_add_funds_negative_amount_rejected(self):
+        user = tu.create_user_with_credit(10)
+        user_id = user["user_id"]
+
+        credit_before = tu.find_user(user_id)["credit"]
+        response_code = tu.add_credit_to_user(user_id, -3)
+        tu.assert_failure(response_code)
+        self.assertEqual(tu.find_user(user_id)["credit"], credit_before)
+
+    def test_payment_pay_negative_amount_rejected_no_credit_increase(self):
+        user = tu.create_user_with_credit(10)
+        user_id = user["user_id"]
+
+        credit_before = tu.find_user(user_id)["credit"]
+        response_code = tu.payment_pay(user_id, -3)
+        tu.assert_failure(response_code)
+        self.assertEqual(tu.find_user(user_id)["credit"], credit_before)
+
+    def test_create_order_unknown_user_rejected(self):
+        unknown_user_id = str(uuid.uuid4())
+
+        create_response = tu._request_with_retry(
+            "POST",
+            f"{tu.ORDER_URL}/orders/create/{unknown_user_id}",
+        )
+        tu.assert_failure(create_response)
+
     def test_checkout_invalid_order_id_has_no_side_effects(self):
         user = tu.create_user_with_credit(11)
         user_id = user["user_id"]
@@ -125,6 +188,20 @@ class TestCheckoutRegression(unittest.TestCase):
 
         self.assertEqual(tu.find_user(user_id)["credit"], initial_credit)
         self.assertEqual(tu.find_item(item_id)["stock"], initial_stock)
+
+    def test_checkout_business_failure_must_be_4xx(self):
+        user = tu.create_user_with_credit(1)
+        user_id = user["user_id"]
+
+        item = tu.create_item_with_stock(price=10, stock=1)
+        item_id = item["item_id"]
+
+        order = tu.create_order_with_lines(user_id, [(item_id, 1)])
+        order_id = order["order_id"]
+
+        response = tu.checkout(order_id)
+        self.assertFalse(tu.status_code_is_success(response.status_code))
+        tu.assert_failure(response)
 
     def test_duplicate_checkout_attempt_has_no_second_commit(self):
         user = tu.create_user_with_credit(20)
@@ -264,6 +341,41 @@ class TestCheckoutRegression(unittest.TestCase):
         self.assertEqual(tu.find_user(user_id)["credit"], 0)
         self.assertEqual(tu.find_item(item_id)["stock"], 0)
         self.assertTrue(tu.get_order_state(order_id)["paid"])
+
+    def test_parallel_non_conflicting_checkouts_complete_quickly_and_both_succeed(self):
+        user_1 = tu.create_user_with_credit(20)
+        user_2 = tu.create_user_with_credit(20)
+
+        item_1 = tu.create_item_with_stock(price=4, stock=1)
+        item_2 = tu.create_item_with_stock(price=5, stock=1)
+
+        order_1 = tu.create_order_with_lines(user_1["user_id"], [(item_1["item_id"], 1)])
+        order_2 = tu.create_order_with_lines(user_2["user_id"], [(item_2["item_id"], 1)])
+
+        barrier = threading.Barrier(2)
+
+        def run_checkout(order_id: str) -> int:
+            barrier.wait()
+            return tu.checkout(order_id).status_code
+
+        started_at = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            future_1 = pool.submit(run_checkout, order_1["order_id"])
+            future_2 = pool.submit(run_checkout, order_2["order_id"])
+            status_1 = future_1.result(timeout=8)
+            status_2 = future_2.result(timeout=8)
+        elapsed = time.monotonic() - started_at
+
+        self.assertLess(elapsed, 8)
+        self.assertTrue(tu.status_code_is_success(status_1))
+        self.assertTrue(tu.status_code_is_success(status_2))
+
+        self.assertEqual(tu.find_item(item_1["item_id"])["stock"], 0)
+        self.assertEqual(tu.find_item(item_2["item_id"])["stock"], 0)
+        self.assertEqual(tu.find_user(user_1["user_id"])["credit"], 16)
+        self.assertEqual(tu.find_user(user_2["user_id"])["credit"], 15)
+        self.assertTrue(tu.get_order_state(order_1["order_id"])["paid"])
+        self.assertTrue(tu.get_order_state(order_2["order_id"])["paid"])
 
 
 if __name__ == "__main__":

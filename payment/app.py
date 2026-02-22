@@ -81,6 +81,9 @@ def find_user(user_id: str):
 
 @app.post('/add_funds/<user_id>/<amount>')
 def add_credit(user_id: str, amount: int):
+    if int(amount) < 0:
+        abort(400, f"Amount cannot be negative, got {amount}")
+
     user_entry: UserValue = get_user_from_db(user_id)
     # update credit, serialize and update database
     user_entry.credit += int(amount)
@@ -93,6 +96,9 @@ def add_credit(user_id: str, amount: int):
 
 @app.post('/pay/<user_id>/<amount>')
 def remove_credit(user_id: str, amount: int):
+    if int(amount) < 0:
+        abort(400, f"Amount cannot be negative, got {amount}")
+
     app.logger.debug(f"Removing {amount} credit from user: {user_id}")
     user_entry: UserValue = get_user_from_db(user_id)
     # update credit, serialize and update database

@@ -1,0 +1,2 @@
+"""Payment service route blueprints."""
+

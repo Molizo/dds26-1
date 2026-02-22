@@ -1,0 +1,2 @@
+"""Stock service route blueprints."""
+

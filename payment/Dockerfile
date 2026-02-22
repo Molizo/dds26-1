@@ -1,11 +1,12 @@
 FROM python:3.12-slim
 
-WORKDIR /home/flask-app
+WORKDIR /home/flask-app/payment
 
-COPY ./requirements.txt .
+COPY payment/requirements.txt ./requirements.txt
 
 RUN pip install -r requirements.txt
 
-COPY . .
+COPY common ./common
+COPY payment ./
 
 EXPOSE 5000

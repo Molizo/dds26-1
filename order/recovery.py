@@ -259,7 +259,6 @@ def recover_tx(tx_entry: CheckoutTxValue):
     if tx_entry.status in {
         STATUS_COMPLETED,
         STATUS_ABORTED,
-        STATUS_FAILED_NEEDS_RECOVERY,
         STATUS_2PC_FINALIZATION_PENDING,
     }:
         _clear_active_tx_best_effort(tx_entry.order_id)

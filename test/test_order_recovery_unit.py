@@ -17,6 +17,7 @@ if ORDER_DIR not in sys.path:
     sys.path.insert(0, ORDER_DIR)
 
 import recovery  # noqa: E402
+from config import TERMINAL_TX_STATUSES  # noqa: E402
 from models import CheckoutTxValue  # noqa: E402
 
 
@@ -71,6 +72,56 @@ class TestRecoveryEndpointStatus(unittest.TestCase):
             recovery._recover_tx_under_lock = original_recover_under_lock
 
         self.assertEqual(refreshed_status, "COMPLETED")
+
+
+class TestRecoveryStatusSemantics(unittest.TestCase):
+    def _make_tx(self, status: str) -> CheckoutTxValue:
+        return CheckoutTxValue(
+            tx_id="unit-tx-status",
+            order_id="order-1",
+            user_id="user-1",
+            total_cost=10,
+            protocol="saga",
+            status=status,
+            items_snapshot=[],
+            stock_prepared=[],
+            stock_committed=[],
+            stock_compensated=[],
+            payment_prepared=False,
+            payment_committed=False,
+            payment_reversed=False,
+            decision=None,
+            started_at_ms=0,
+            updated_at_ms=0,
+            last_error=None,
+        )
+
+    def test_failed_needs_recovery_is_not_terminal(self):
+        self.assertFalse(recovery.STATUS_FAILED_NEEDS_RECOVERY in TERMINAL_TX_STATUSES)
+
+    def test_recover_tx_keeps_active_tx_for_failed_needs_recovery(self):
+        tx = self._make_tx(recovery.STATUS_FAILED_NEEDS_RECOVERY)
+        clear_calls: list[str] = []
+
+        original_fetch_order = recovery._fetch_order
+        original_recover_saga_tx = recovery._recover_saga_tx
+        original_clear_active = recovery._clear_active_tx_best_effort
+        try:
+            recovery._fetch_order = lambda _order_id: None
+
+            def _fake_recover_saga(tx_entry: CheckoutTxValue, _order_entry):
+                tx_entry.status = recovery.STATUS_FAILED_NEEDS_RECOVERY
+
+            recovery._recover_saga_tx = _fake_recover_saga
+            recovery._clear_active_tx_best_effort = lambda order_id: clear_calls.append(order_id)
+
+            recovery.recover_tx(tx)
+        finally:
+            recovery._fetch_order = original_fetch_order
+            recovery._recover_saga_tx = original_recover_saga_tx
+            recovery._clear_active_tx_best_effort = original_clear_active
+
+        self.assertEqual(clear_calls, [])
 
 
 if __name__ == "__main__":

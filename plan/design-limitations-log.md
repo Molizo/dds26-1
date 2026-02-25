@@ -1,5 +1,22 @@
 # Design Limitations Log
 
+## 2026-02-25 - Recovery-needed status incorrectly treated as terminal
+
+- Limitation encountered:
+  - `FAILED_NEEDS_RECOVERY` was classified as terminal, which released the per-order active transaction guard before recovery completed.
+
+- Why current design causes it:
+  - Checkout and recovery paths reused one terminal-status set for both "flow ended" and "safe to allow a new checkout".
+  - `FAILED_NEEDS_RECOVERY` means recovery is still required, so it does not satisfy the second condition.
+
+- Impact:
+  - Consistency and reliability: a second checkout could begin while prior side effects were still in recovery, risking duplicate charge or stock drift.
+
+- Chosen mitigation/follow-up:
+  - Remove `FAILED_NEEDS_RECOVERY` from terminal transaction statuses.
+  - Keep active transaction pointer until recovery reaches `COMPLETED` or `ABORTED` (or other explicitly safe terminal states).
+  - Preserve background/request-path recovery to eventually move the stuck transaction to a safe terminal outcome.
+
 ## 2026-02-22 - Synchronous checkout vs failure recovery latency
 
 - Limitation encountered:

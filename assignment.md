@@ -16,7 +16,7 @@ We will judge all project implementations according to their difficulty, the qua
 
 Implementing Microservices with Python Flask and Redis. We provide a project template: [https://github.c](https://github.com/delftdata/wdm-project-template)
 
-[om/delftdata/wdm-project-template](https://github.com/delftdata/wdm-project-template). If you want to use another Python framework (e.g., async Flask with Quart, etc.) you have the right to do so. Just bear in mind that you cannot use any other language and you cannot change the following external-world-facing API described below (and already implemented in the template).
+[om/delftdata/wdm-projecJt-template](https://github.com/delftdata/wdm-project-template). If you want to use another Python framework (e.g., async Flask with Quart, etc.) you have the right to do so. Just bear in mind that you cannot use any other language and you cannot change the following external-world-facing API described below (and already implemented in the template).
 
 ### Microservice Endpoints to Implement (already in the template)
 
@@ -129,11 +129,11 @@ To test microservices you can use postman ([https://www.getpostman.com/](https:/
 * February 16th: group formation  
 * Phase 1: 13th March:   
   * Implement two-phase commit and SAGAs protocols in Flask \+ Redis  
-  * Fault-tolerance: we should be able to fail a container, and your system should be able to recover. This includes killing a database, or a service instance.   
+  * Fault-tolerance: we should be able to fail ONE container at a time, and your system should be able to recover. This includes killing a database, or a service instance.   
   * We will evaluate your system by failing a single container, letting the system recover, then fail another, etc.   
   * Your system should remain consistent.  
   * Stretch-goal: high-performance (i.e., zero down-time)  under failures  
-  * Criteria: performance, consistency  
+  * Criteria: consistency, performance  
   * Deliverable:  
     Public Github repository link; {username}/dds26-{team\#} (team\# is your group number on brightspace)  
   * This benchmark should be able to work on a local machine without changes:   
@@ -144,4 +144,4 @@ To test microservices you can use postman ([https://www.getpostman.com/](https:/
   * You will share, again, a github repository with the implementation of the orchestrator, and give us an implementation of the Shopping-cart project that uses that orchestrator.   
     
 
-contributions.txt should be a file at the top-level directory of your repository where each member describes (in a sentence) what they have contributed to the project (e.g., code, architecture, documentation, experiments, psychological support, beer, cookies, etc.).  
+contributions.txt should be a file at the top-level directory of your repository where each member describes (in a sentence) what they have contributed to the project (e.g., code, architecture, documentation, experiments, psychological support, beer, cookies, etc.).

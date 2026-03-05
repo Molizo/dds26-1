@@ -12,42 +12,82 @@ services:
       - stock-service
       - payment-service
 
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   order-service:
-    build: ./order
+    build:
+      context: .
+      dockerfile: order/Dockerfile
     image: order:latest
     environment:
-      - GATEWAY_URL=http://gateway:80
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+      - STOCK_SERVICE_URL=http://stock-service:5000
+      - PAYMENT_SERVICE_URL=http://payment-service:5000
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - CHECKOUT_PROTOCOL=saga
+    command: gunicorn -b 0.0.0.0:5000 -w 8 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:
-      - order-db
+      order-db:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
 
   order-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
 
   stock-service:
-    build: ./stock
+    build:
+      context: .
+      dockerfile: stock/Dockerfile
     image: stock:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      - ORDER_SERVICE_URL=http://order-service:5000
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - CHECKOUT_PROTOCOL=saga
+    command: gunicorn -b 0.0.0.0:5000 -w 4 -c gunicorn.conf.py --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
     depends_on:
-      - stock-db
+      stock-db:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
 
   stock-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
 
   payment-service:
-    build: ./payment
+    build:
+      context: .
+      dockerfile: payment/Dockerfile
     image: user:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      - ORDER_SERVICE_URL=http://order-service:5000
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - CHECKOUT_PROTOCOL=saga
+    command: gunicorn -b 0.0.0.0:5000 -w 4 -c gunicorn.conf.py --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
     depends_on:
-      - payment-db
+      payment-db:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
 
   payment-db:
     image: redis:7.2-bookworm

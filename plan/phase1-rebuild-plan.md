@@ -813,7 +813,7 @@ common/
 
 coordinator/
   models.py           # CheckoutTxValue, status constants
-  ports.py            # Abstract participant interface
+  ports.py            # Abstract interfaces: OrderPort, TxStorePort (+ participant interface)
   service.py          # CoordinatorService: execute_checkout, resume_transaction
   recovery.py         # Background recovery worker
   messaging.py        # Publish commands, consume replies, correlation
@@ -854,8 +854,49 @@ The important constraints are architectural, not naming:
 - `common/` is a shared package imported by all three services and the coordinator. It contains message definitions (`msgspec.Struct` types), RabbitMQ helpers, and shared constants. It must not depend on Flask, Redis, or any service-specific code.
 - `coordinator/` must not depend on Flask
 - `coordinator/` must depend on interfaces/ports, not concrete route modules
+- `coordinator/` must access order domain state and tx persistence exclusively through port interfaces defined in `coordinator/ports.py` (see "Coordinator Port Interfaces" section below). In Phase 1 the implementations are direct Redis calls living in `order/store.py`. In Phase 2 the implementations swap to HTTP calls or the orchestrator's own Redis — coordinator code does not change.
 - participant workers consume from RabbitMQ and call Lua scripts — they do not import Flask
 - the messaging layer is shared but transport-agnostic enough that Phase 2 can replace RabbitMQ with another broker or direct HTTP if needed
+
+### Coordinator Port Interfaces
+
+The coordinator must not call Redis or the order domain directly. All external state access goes through abstract interfaces defined in `coordinator/ports.py`. This is the primary mechanism that makes Phase 2 extraction a swap of implementations rather than a rewrite of protocol logic.
+
+#### `OrderPort`
+
+```python
+class OrderPort(Protocol):
+    def read_order(self, order_id: str) -> Optional[OrderSnapshot]: ...
+    def mark_paid(self, order_id: str, tx_id: str) -> bool: ...
+```
+
+- `read_order`: returns the order's items, user_id, total_cost, and paid flag. Used by the coordinator to build the item snapshot and check paid status.
+- `mark_paid`: sets `paid = true` on the order domain record. Must be idempotent (no-op if already paid). Returns whether the order was successfully marked.
+
+Phase 1 implementation: direct Redis read/write in `order/store.py`.
+Phase 2 implementation: HTTP call to `POST /internal/orders/{order_id}/mark_paid` on the order service.
+
+#### `TxStorePort`
+
+```python
+class TxStorePort(Protocol):
+    def create_tx(self, tx: CheckoutTxValue) -> None: ...
+    def update_tx(self, tx: CheckoutTxValue) -> None: ...
+    def get_tx(self, tx_id: str) -> Optional[CheckoutTxValue]: ...
+    def get_non_terminal_txs(self) -> list[CheckoutTxValue]: ...
+    def set_decision(self, tx_id: str, decision: str) -> None: ...
+    def get_decision(self, tx_id: str) -> Optional[str]: ...
+    def set_commit_fence(self, order_id: str, tx_id: str) -> None: ...
+    def get_commit_fence(self, order_id: str) -> Optional[str]: ...
+    def clear_commit_fence(self, order_id: str) -> None: ...
+    def acquire_active_tx_guard(self, order_id: str, tx_id: str, ttl: int) -> bool: ...
+    def get_active_tx_guard(self, order_id: str) -> Optional[str]: ...
+    def clear_active_tx_guard(self, order_id: str) -> None: ...
+    def refresh_active_tx_guard(self, order_id: str, ttl: int) -> bool: ...
+```
+
+Phase 1 implementation: direct Redis calls in `order/store.py`. All tx keys (`tx:{tx_id}`, `tx_decision:{tx_id}`, `order_active_tx:{order_id}`, `order_commit_fence:{order_id}`) live in the order service's Redis.
+Phase 2 implementation: the orchestrator gets its own Redis instance and owns all tx state directly. The `TxStorePort` implementation becomes local Redis calls inside the orchestrator service — no cross-service access needed. The `order_active_tx` and `order_commit_fence` keys move with the coordinator since they are coordinator concerns, not order-domain concerns.
 
 ## Data Model
 
@@ -906,7 +947,7 @@ Non-terminal statuses (**must NOT clear active-tx guard**):
 - `INIT` — tx record created, no participant commands sent yet
 - `HOLDING` — hold commands published to participants, waiting for replies
 - `HELD` — all holds succeeded, ready for decision (2PC) or finalization (SAGA)
-- `COMMITTING` — commit decision persisted, commit commands published (2PC only)
+- `COMMITTING` — commit commands published to participants, awaiting confirmations. In 2PC: commit decision persisted before entering this state. In SAGA: order marked paid before entering this state.
 - `COMPENSATING` — compensation/abort commands published, waiting for replies
 - `FAILED_NEEDS_RECOVERY` — an operation failed and recovery must resolve it
 
@@ -934,8 +975,9 @@ FAILED_NEEDS_RECOVERY → COMPLETED (recovery discovers commits already confirme
 **Stale `HOLDING` recovery**: if the coordinator crashes mid-`HOLDING` (e.g., one participant reply received and its flag persisted, but the process dies before the second reply or status transition), the tx stays in `HOLDING` with partially-updated flags. The recovery worker treats stale `HOLDING` the same as `FAILED_NEEDS_RECOVERY`: it inspects the participant flags to determine which holds succeeded, then compensates or completes forward accordingly. There is no explicit `HOLDING → FAILED_NEEDS_RECOVERY` transition needed — recovery operates directly on the stale `HOLDING` record. The active-tx guard's TTL ensures the guard eventually expires so recovery can acquire it.
 
 SAGA recovery direction:
-- `HELD` with both holds succeeded → complete forward (mark paid, send commits). Note: if the coordinator crashes after marking the order paid but before transitioning to `COMMITTING`, recovery still sees `HELD`. This is safe because `mark paid` is idempotent (a second write is a no-op on an already-paid order). Recovery re-marks paid, publishes commit commands, and transitions to `COMPLETED`.
+- `HELD` or `HOLDING` with both `stock_held` and `payment_held` true → complete forward (mark paid, send commits). The `HOLDING` + both-flags-true case means the coordinator crashed after receiving both replies but before transitioning to `HELD`. Note: if the coordinator crashes after marking the order paid but before transitioning to `COMMITTING`, recovery still sees `HELD`. This is safe because `mark paid` is idempotent (a second write is a no-op on an already-paid order). Recovery re-marks paid, publishes commit commands, and transitions to `COMPLETED`.
 - `HOLDING` with one hold succeeded, one failed/unknown → compensate all that may have succeeded (including timed-out participants)
+- `HOLDING` with neither flag true → no participant succeeded (or coordinator crashed before persisting any flag). Mark aborted. No compensation needed, but recovery may still publish release/refund defensively (participants return `tx_not_found` harmlessly).
 - `COMMITTING` → re-publish commit commands (order is already paid, just finalizing participant records)
 - `COMPENSATING` → retry compensation
 
@@ -960,7 +1002,9 @@ FAILED_NEEDS_RECOVERY → COMPLETED (recovery discovers order already paid)
 2PC recovery direction:
 - `tx_decision:{tx_id}` exists with value `commit` → re-publish commit commands
 - `order_commit_fence:{order_id}` exists → re-publish commit commands
-- neither exists → presumed abort → publish abort commands
+- `HOLDING` with both prepare flags true but no decision marker → presumed abort (decision was never written, so no commit happened). Publish abort commands to both participants.
+- `HOLDING` with partial or no flags true → presumed abort. Publish abort commands to all participants that may have prepared (safe — abort on non-existent prepare returns `tx_not_found`).
+- all other non-terminal states with no commit decision → presumed abort → publish abort commands
 
 ### Structured Application Logging for Protocol Steps
 
@@ -1698,7 +1742,8 @@ What should happen:
    - This is the highest-priority correctness fix; without it, no higher-level protocol matters.
 2. Add RabbitMQ to docker-compose:
    - use `rabbitmq:3-management` image for local development (includes management UI for debugging)
-   - configure durable queues: `stock.commands`, `payment.commands`, `coordinator.replies`
+   - configure durable queues: `stock.commands`, `payment.commands`
+   - reply queues are per-process exclusive auto-delete queues (`coordinator.replies.{uuid}`), declared at worker startup — not pre-configured as durable queues
    - configure dead-letter queues: `stock.commands.dlq`, `payment.commands.dlq`
    - all messages persistent (delivery_mode=2)
    - add `RABBITMQ_URL` environment variable to all services
@@ -2019,7 +2064,7 @@ This rebuild is ready for Phase 1 delivery when all of the following are true:
 3. The coordinator logic is separated from Flask routes.
 4. Recovery is durable and explicit.
 5. The main consistency invariants are enforced in tests.
-6. The coordinator can later be moved into a standalone service with mostly adapter-level changes.
+6. The coordinator accesses order domain state and tx persistence exclusively through `OrderPort` and `TxStorePort` interfaces, so it can be moved into a standalone service by swapping implementations alone.
 7. Performance measurements explicitly separate no-op request throughput from committed checkout throughput.
 8. Critical logic remains modular, with no duplicated recovery/protocol paths.
 9. Non-obvious correctness-critical code paths are commented clearly enough to explain why they are safe.
@@ -2033,16 +2078,38 @@ This rebuild is ready for Phase 1 delivery when all of the following are true:
 
 ## Phase 2 Extraction Path
 
-The rebuild is intentionally shaped so Phase 2 becomes a relocation exercise, not a redesign.
+The rebuild is intentionally shaped so Phase 2 becomes a relocation exercise, not a redesign. The port interfaces (`OrderPort`, `TxStorePort`) and RabbitMQ participant transport are the two mechanisms that make this possible.
 
-Expected Phase 2 move:
+### What moves cleanly (no logic changes)
 
-1. Move `coordinator/` into its own service. It already communicates with participants via RabbitMQ, so the transport layer does not change.
-2. Replace the in-process coordinator call from the `order` checkout route with a network call (HTTP or RabbitMQ) to the orchestrator service.
-3. Keep protocol logic, state transitions, and recovery model largely unchanged.
-4. Move the recovery worker with the coordinator into the orchestrator service.
-5. Keep participant RabbitMQ consumers unchanged — they already talk to the coordinator through message queues, not in-process calls.
+1. **`coordinator/`** moves into its own service. Protocol logic, state transitions, and recovery model are unchanged — they depend only on port interfaces and RabbitMQ, not on Flask or direct Redis access.
+2. **Recovery worker** moves with the coordinator.
+3. **Participant RabbitMQ consumers** (stock, payment) are unchanged — they already communicate through message queues, not in-process calls.
+4. **`common/`** remains shared across all services (same as Phase 1).
 
-The RabbitMQ-based architecture makes Phase 2 extraction simpler than the direct-HTTP alternative, because participants already communicate through queues rather than being coupled to the order service's internal URL.
+### What requires new adapter implementations
 
-If Phase 1 code cannot be moved this way, the boundary is still too coupled and should be corrected before deeper implementation continues.
+1. **`OrderPort` implementation swaps from direct Redis to HTTP**:
+   - Phase 1: `order/store.py` reads/writes order records in Redis directly.
+   - Phase 2: the orchestrator calls new internal APIs on the order service:
+     - `GET /internal/orders/{order_id}` — read order snapshot
+     - `POST /internal/orders/{order_id}/mark_paid` — idempotent mark-paid
+   - The coordinator code does not change; only the injected `OrderPort` implementation changes.
+
+2. **`TxStorePort` implementation becomes local to the orchestrator**:
+   - Phase 1: tx state lives in order's Redis via `order/store.py`.
+   - Phase 2: the orchestrator gets its own Redis instance and owns all tx state (`tx:{tx_id}`, `tx_decision:{tx_id}`, `order_active_tx:{order_id}`, `order_commit_fence:{order_id}`) directly. The `TxStorePort` implementation is local Redis calls inside the orchestrator — no cross-service access.
+   - The coordinator code does not change; only the injected `TxStorePort` implementation changes.
+
+3. **Checkout route becomes a thin proxy in the order service**:
+   - Phase 1: `POST /orders/checkout/{order_id}` lives in the order service, acquires the guard, calls the coordinator in-process, and clears the guard.
+   - Phase 2: the order service's checkout route becomes a stateless proxy that forwards to the orchestrator via internal HTTP. The orchestrator owns the full lifecycle including guard acquisition/clearing, the already-paid fast path, and result-to-HTTP mapping. The order service just forwards the request and returns the orchestrator's response.
+   - Why proxy instead of direct nginx routing: the orchestrator must not be publicly accessible from the internet. All external traffic enters through nginx → order service. The orchestrator is an internal-only service, reachable only by other services on the Docker network.
+
+4. **`GET /internal/tx_decision/{tx_id}` moves to the orchestrator**:
+   - Phase 1: served by the order service because tx state is in order's Redis.
+   - Phase 2: served by the orchestrator because tx state is in the orchestrator's Redis. Participant `ORDER_SERVICE_URL` config changes to `ORCHESTRATOR_SERVICE_URL`.
+
+### Extraction litmus test
+
+If Phase 1 code cannot be moved by swapping `OrderPort` and `TxStorePort` implementations alone (plus the route-to-proxy change), the boundary is still too coupled and should be corrected before deeper implementation continues.

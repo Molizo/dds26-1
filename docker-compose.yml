@@ -36,7 +36,7 @@ services:
       - PAYMENT_SERVICE_URL=http://payment-service:5000
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - CHECKOUT_PROTOCOL=saga
-    command: gunicorn -b 0.0.0.0:5000 -w 8 --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 8 -c gunicorn.conf.py --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:

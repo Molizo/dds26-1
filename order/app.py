@@ -13,10 +13,19 @@ from flask import Flask, jsonify, abort, Response
 from store import (
     OrderValue,
     get_order,
+    read_order_snapshot,
     mark_order_paid,
     get_decision,
+    get_tx,
+    acquire_active_tx_guard,
+    get_active_tx_guard,
+    clear_active_tx_guard,
 )
-from common.constants import VALID_PROTOCOLS
+from common.constants import (
+    VALID_PROTOCOLS, TERMINAL_STATUSES, ACTIVE_TX_GUARD_TTL,
+    STATUS_FAILED_NEEDS_RECOVERY,
+)
+from common.result import CheckoutResult
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -34,6 +43,7 @@ if CHECKOUT_PROTOCOL not in VALID_PROTOCOLS:
 
 STOCK_SERVICE_URL = os.environ['STOCK_SERVICE_URL']
 PAYMENT_SERVICE_URL = os.environ['PAYMENT_SERVICE_URL']
+RABBITMQ_URL = os.environ.get('RABBITMQ_URL', 'amqp://guest:guest@rabbitmq:5672/')
 
 app = Flask("order-service")
 
@@ -53,6 +63,44 @@ atexit.register(close_db_connection)
 
 # Reuse a single Session for connection pooling on outbound HTTP calls
 _session = requests.Session()
+
+
+# ---------------------------------------------------------------------------
+# Coordinator (lazy init — reply consumer starts in post_fork)
+# ---------------------------------------------------------------------------
+
+class _OrderPortImpl:
+    """Phase 1 OrderPort: direct Redis."""
+    def read_order(self, order_id):
+        return read_order_snapshot(db, order_id)
+
+    def mark_paid(self, order_id, tx_id):
+        return mark_order_paid(db, order_id)
+
+
+class _TxStoreImpl:
+    """Phase 1 TxStorePort: direct Redis via store module."""
+    def __getattr__(self, name):
+        import store
+        fn = getattr(store, name)
+        # Bind db as first argument
+        def bound(*args, **kwargs):
+            return fn(db, *args, **kwargs)
+        setattr(self, name, bound)
+        return bound
+
+
+def _get_coordinator():
+    """Lazy-init coordinator service (can't create at import time because
+    the reply consumer starts in post_fork)."""
+    if not hasattr(_get_coordinator, '_instance'):
+        from coordinator.service import CoordinatorService
+        _get_coordinator._instance = CoordinatorService(
+            rabbitmq_url=RABBITMQ_URL,
+            order_port=_OrderPortImpl(),
+            tx_store=_TxStoreImpl(),
+        )
+    return _get_coordinator._instance
 
 
 # ---------------------------------------------------------------------------
@@ -154,53 +202,52 @@ def add_item(order_id: str, item_id: str, quantity: int):
 
 
 # ---------------------------------------------------------------------------
-# Checkout
-#
-# Step 1: Keep the existing sequential HTTP checkout logic, migrated from
-# GATEWAY_URL to direct service URLs (STOCK_SERVICE_URL, PAYMENT_SERVICE_URL).
-# The RabbitMQ-based coordinator replaces this in Step 2.
+# Checkout — thin adapter over CoordinatorService
 # ---------------------------------------------------------------------------
-
-def _rollback_stock(removed_items: list[tuple[str, int]]) -> None:
-    for item_id, quantity in removed_items:
-        _send_post(f"{STOCK_SERVICE_URL}/add/{item_id}/{quantity}")
-
 
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
     app.logger.debug("Checking out %s", order_id)
     order = _get_order_or_abort(order_id)
 
+    # Already-paid fast path: no tx record, no RabbitMQ, no side effects
     if order.paid:
         return Response("Checkout successful", status=200)
 
-    items_quantities: dict[str, int] = defaultdict(int)
-    for item_id, quantity in order.items:
-        items_quantities[item_id] += quantity
+    # Generate tx_id upfront so the guard stores the real tx_id
+    tx_id = str(uuid.uuid4())
 
-    removed_items: list[tuple[str, int]] = []
-    for item_id, quantity in items_quantities.items():
-        stock_reply = _send_post(f"{STOCK_SERVICE_URL}/subtract/{item_id}/{quantity}")
-        if stock_reply.status_code != 200:
-            _rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
-        removed_items.append((item_id, quantity))
+    # Acquire active-tx guard (SET NX EX)
+    acquired = acquire_active_tx_guard(db, order_id, tx_id, ACTIVE_TX_GUARD_TTL)
 
-    user_reply = _send_post(
-        f"{PAYMENT_SERVICE_URL}/pay/{order.user_id}/{order.total_cost}"
-    )
-    if user_reply.status_code != 200:
-        _rollback_stock(removed_items)
-        abort(400, "User out of credit")
+    if not acquired:
+        # Guard held by another tx — check if it's terminal
+        existing_tx_id = get_active_tx_guard(db, order_id)
+        if existing_tx_id:
+            existing_tx = get_tx(db, existing_tx_id)
+            if existing_tx and existing_tx.status in TERMINAL_STATUSES:
+                # Stale terminal guard — clean up and retry
+                clear_active_tx_guard(db, order_id)
+                acquired = acquire_active_tx_guard(
+                    db, order_id, tx_id, ACTIVE_TX_GUARD_TTL
+                )
 
-    if not mark_order_paid(db, order_id):
-        # Payment succeeded but we failed to mark paid — rollback
-        _send_post(f"{PAYMENT_SERVICE_URL}/add_funds/{order.user_id}/{order.total_cost}")
-        _rollback_stock(removed_items)
-        abort(400, DB_ERROR_STR)
+        if not acquired:
+            abort(409, "Checkout already in progress")
 
-    app.logger.debug("Checkout successful for %s", order_id)
-    return Response("Checkout successful", status=200)
+    # Run coordinator
+    coordinator = _get_coordinator()
+    result: CheckoutResult = coordinator.execute_checkout(order_id, CHECKOUT_PROTOCOL, tx_id)
+
+    # Clear guard on terminal result (but NOT on FAILED_NEEDS_RECOVERY)
+    if result.success or result.status_code == 400:
+        clear_active_tx_guard(db, order_id)
+
+    # Map result to HTTP
+    if result.success:
+        return Response("Checkout successful", status=200)
+    else:
+        abort(result.status_code, result.error or "Checkout failed")
 
 
 # ---------------------------------------------------------------------------
@@ -209,12 +256,6 @@ def checkout(order_id: str):
 
 @app.get('/internal/tx_decision/<tx_id>')
 def tx_decision(tx_id: str):
-    """Return the durable coordinator decision for a transaction.
-
-    Participants may query this during startup reconciliation to determine
-    whether to commit or abort a prepared hold. They must not unilaterally
-    release holds when the answer is 'unknown'.
-    """
     decision = get_decision(db, tx_id)
     if decision is None:
         return jsonify({"decision": "unknown"})

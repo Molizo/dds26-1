@@ -182,6 +182,8 @@ Use this log to avoid repeating known mistakes and to justify walking back earli
 
 ## 2026-03-02 - Lease locks, active-tx guards, and prepared holds must remain separate
 
+**SUPERSEDED on 2026-03-05**: The lease lock and active-tx guard have been merged into a single mechanism (durable active-tx pointer with TTL). See entry "2026-03-05 - Three separate locking mechanisms create interaction surface area" below.
+
 - Limitation encountered:
   - It is easy to conflate request mutual exclusion, transaction ownership, and prepared resource protection into one lock concept.
 
@@ -192,10 +194,15 @@ Use this log to avoid repeating known mistakes and to justify walking back earli
   - Consistency risk: clearing a request lock or losing a lease can accidentally be treated as permission to begin a new checkout.
   - Reliability risk: rollback and recovery logic can release the wrong protection at the wrong time.
 
-- Chosen mitigation or follow-up action:
+- Original mitigation (now superseded):
   - Keep the per-order lease lock only for short request-path mutual exclusion.
   - Keep a separate durable active transaction guard until the tx is truly safe to re-enter.
   - Keep prepared holds in participant stores as durable resource reservations until `commit` or `abort`.
+
+- Revised mitigation (2026-03-05):
+  - Merge lease lock and active-tx guard into one mechanism: `SET order_active_tx:{order_id} {tx_id} NX EX {ttl}`.
+  - Keep prepared holds as a separate mechanism in participant stores.
+  - Two mechanisms instead of three reduces interaction surface area.
 
 ## 2026-03-02 - Reused-order benchmarks can inflate throughput with cheap `200` responses
 
@@ -249,6 +256,8 @@ Use this log to avoid repeating known mistakes and to justify walking back earli
 
 ## 2026-03-02 - Summary and tx-log updates must not diverge
 
+**SUPERSEDED on 2026-03-05**: The per-transaction Redis step log has been replaced with structured application-level logging. The divergence problem no longer exists because there is only one durable source of truth (the tx summary record + decision marker). See entry "2026-03-05 - Per-transaction Redis step log adds unnecessary write overhead" below.
+
 - Limitation encountered:
   - A transaction summary record and an append-only tx log can contradict each other if updated separately for the same transition.
 
@@ -258,9 +267,12 @@ Use this log to avoid repeating known mistakes and to justify walking back earli
 - Impact:
   - Reliability risk: recovery can still face ambiguous crash windows despite having more recorded data.
 
-- Chosen mitigation or follow-up action:
+- Original mitigation (now superseded):
   - Update the summary and the corresponding log entry in one atomic write unit for the same transition.
   - Treat divergence between the two as a correctness bug, not a normal recovery state.
+
+- Revised mitigation (2026-03-05):
+  - Eliminate the second durable source of truth entirely. Use application logs for intermediate steps; use only the tx summary + decision marker for recovery.
 
 ## 2026-03-02 - Prepared holds need cleanup and participant-side reconciliation
 
@@ -280,6 +292,8 @@ Use this log to avoid repeating known mistakes and to justify walking back earli
 
 ## 2026-03-02 - A message bus would add complexity before it improves the Phase 1 hot path
 
+**REVERSED on 2026-03-05**: RabbitMQ is now used for internal coordinator↔participant communication. See entry "2026-03-05 - RabbitMQ adopted for internal transport with parallel fan-out" below.
+
 - Limitation encountered:
   - A message bus was considered for the checkout path to improve replayability, recovery, and load distribution.
 
@@ -291,10 +305,14 @@ Use this log to avoid repeating known mistakes and to justify walking back earli
   - Performance risk: extra publish/consume/reply hops increase tail latency on the hot path.
   - Delivery risk: the team can drift into a larger infrastructure project before stabilizing Phase 1 correctness.
 
-- Chosen mitigation or follow-up action:
+- Original mitigation (now reversed):
   - Keep the Phase 1 checkout path on direct internal HTTP.
-  - Use durable Redis transaction state plus a tx step log for replay and recovery.
-  - Revisit a message bus later only for background repair, async SAGA variants, or a later-phase architecture.
+
+- Revised mitigation (2026-03-05):
+  - Use RabbitMQ for parallel coordinator↔participant communication.
+  - The coordinator blocks on reply queues (no Redis polling loop like attempt 1).
+  - The latency cost of broker hops is offset by parallel fan-out to stock and payment.
+  - The assignment rewards event-driven architecture and the lecturer advises for it.
 
 ## 2026-03-02 - Full event sourcing would overshoot the current scope
 
@@ -549,6 +567,212 @@ Use this log to avoid repeating known mistakes and to justify walking back earli
     - the tests
     before or alongside the local fix
   - Prefer strengthening the model over accumulating one-off repairs.
+
+## 2026-03-05 - RabbitMQ adopted for internal transport with parallel fan-out
+
+- Limitation encountered:
+  - The previous plan used serial direct HTTP calls for coordinator↔participant communication. This was the dominant latency bottleneck (attempt 2 made serial stock→payment calls). The plan also rejected message brokers despite the assignment explicitly rewarding event-driven architectures.
+
+- Why the current design caused it:
+  - The plan was conservative after attempt 1's scope drift into RabbitMQ infrastructure. The overcorrection was to avoid any message broker entirely.
+
+- Impact:
+  - **Performance risk (high)**: serial HTTP calls double the latency of every checkout.
+  - **Grading risk (high)**: the assignment explicitly says "Event-driven asynchronous architectures...will get extra points" and the lecturer advises for a message broker. Ignoring both is a bad tradeoff for a course project.
+
+- Chosen mitigation or follow-up action:
+  - Adopt RabbitMQ as internal transport. Coordinator publishes commands in parallel to stock and payment queues.
+  - Coordinator blocks on a reply queue (bounded timeout) — no Redis polling loop like attempt 1.
+  - Preserve attempt 1's good patterns: durable persistent messages, DLQ, thread-local publisher connections, Lua-based idempotent consumers.
+  - Avoid attempt 1's mistakes: no separate worker process, no polling loop, no complex retry-queue topology.
+  - Updated in `plan/phase1-rebuild-plan.md`: decision record reversed, architecture and protocol sections updated.
+
+## 2026-03-05 - Parallel execution requires handling partial success in both SAGA and 2PC
+
+- Limitation encountered:
+  - When stock and payment execute in parallel, either one can succeed while the other fails. The previous serial design (stock first, then payment) only needed to handle "stock succeeded, payment failed" — not the reverse.
+
+- Why the current design causes it:
+  - Parallel fan-out means both success and failure can arrive from either participant independently.
+
+- Impact:
+  - **Consistency risk (medium)**: partial success scenarios must be compensated correctly in both directions (stock OK + payment fail, payment OK + stock fail).
+
+- Chosen mitigation or follow-up action:
+  - SAGA handles both partial-success directions: if stock succeeds but payment fails → release stock; if payment succeeds but stock fails → refund payment.
+  - 2PC: if either prepare fails or times out → abort both. The commit decision is only written when both prepare replies are positive.
+  - Recovery handles all four partial states (both succeed, both fail, stock-only, payment-only).
+  - Updated in `plan/phase1-rebuild-plan.md`: SAGA and 2PC protocol sections updated.
+
+## 2026-03-05 - Attempt 2's FAILED_NEEDS_RECOVERY bug must not recur
+
+- Limitation encountered:
+  - In attempt 2, `FAILED_NEEDS_RECOVERY` was included in `TERMINAL_TX_STATUSES`, which caused `is_terminal_status()` to return true. This cleared the active-tx guard, allowing a second concurrent checkout to start while the first was still recovering. This caused duplicate charges and stock drift.
+
+- Why the current design caused it:
+  - The status taxonomy conflated "flow stopped" with "safe to re-enter." `FAILED_NEEDS_RECOVERY` means the flow stopped, but the transaction is NOT safe to re-enter.
+
+- Impact:
+  - **Consistency risk (critical)**: duplicate charges, duplicate stock subtractions, and inconsistent order state.
+
+- Chosen mitigation or follow-up action:
+  - `FAILED_NEEDS_RECOVERY` is explicitly NOT in the terminal status set.
+  - The active-tx guard is only cleared when the transaction reaches `COMPLETED` or `ABORTED`.
+  - A dedicated test must assert this invariant.
+  - Updated in `plan/phase1-rebuild-plan.md`: step 2 acceptance criteria and testing priorities.
+
+## 2026-03-05 - Participant read-modify-write operations are non-atomic
+
+- Limitation encountered:
+  - All three services use a `GET` then `SET` pattern for stock subtract/add and credit pay/add_funds. Two concurrent calls can both read the same value, both compute independently, and both write — silently losing one operation.
+
+- Why the current design caused it:
+  - The template code uses simple `db.get()` / `db.set()` without any atomicity mechanism. This was inherited from the starter project and never fixed.
+
+- Impact:
+  - **Consistency risk (critical)**: under benchmark load, stock and credit balances will drift. This makes any higher-level consistency protocol (SAGA or 2PC) meaningless — the foundation is broken.
+
+- Chosen mitigation or follow-up action:
+  - Replace all participant read-modify-write operations with Lua scripts that perform read, check, modify, and write atomically on the Redis server.
+  - This applies to both public endpoints and internal transaction endpoints.
+  - Updated in `plan/phase1-rebuild-plan.md`: added as non-negotiable #15 and explicit decision record.
+
+## 2026-03-05 - Internal calls routed through nginx gateway add unnecessary latency
+
+- Limitation encountered:
+  - The order service calls stock and payment through `GATEWAY_URL` (the nginx gateway), adding an extra network hop and serialization cycle to every internal call.
+
+- Why the current design caused it:
+  - The template only provided `GATEWAY_URL` as the service discovery mechanism. Internal direct URLs were never configured.
+
+- Impact:
+  - **Performance risk (high)**: every checkout makes multiple internal HTTP calls. Each one goes client → nginx → service instead of client → service. Under load, nginx becomes a bottleneck for internal traffic.
+
+- Chosen mitigation or follow-up action:
+  - Add `STOCK_SERVICE_URL` and `PAYMENT_SERVICE_URL` environment variables to docker-compose.
+  - Internal calls use these direct URLs. Gateway is only for external clients.
+  - Updated in `plan/phase1-rebuild-plan.md`: added as non-negotiable #16 and explicit decision record.
+
+## 2026-03-05 - Gunicorn worker count of 2 is a severe throughput bottleneck
+
+- Limitation encountered:
+  - docker-compose runs all services with `-w 2`. With synchronous blocking HTTP calls, 2 workers means at most 2 concurrent checkouts.
+
+- Why the current design caused it:
+  - Default worker count was never tuned for the synchronous call pattern.
+
+- Impact:
+  - **Performance risk (critical)**: the plan targets ~10k req/s but 2 sync workers can barely handle 50-100 real checkouts/s. This is the dominant bottleneck before any protocol overhead.
+
+- Chosen mitigation or follow-up action:
+  - Increase to at least 8 workers for order service, 4 for stock and payment.
+  - Tune further based on benchmark results.
+  - Async workers (gevent/eventlet) remain a later optimization option.
+  - Updated in `plan/phase1-rebuild-plan.md`: added as non-negotiable #17 and explicit decision record.
+
+## 2026-03-05 - Per-transaction Redis step log adds unnecessary write overhead
+
+- Limitation encountered:
+  - The original plan required an append-only per-transaction step log in Redis with ~20 event types and per-entry metadata. Each checkout would generate 6-10 durable writes just for observability.
+
+- Why the current design caused it:
+  - The plan wanted to avoid the "summary flags alone are insufficient for recovery" problem from attempt 2. A full step log was the proposed solution.
+
+- Impact:
+  - **Performance risk (medium)**: the step log writes add material Redis pressure per checkout under load.
+  - **Complexity risk**: the atomic-write requirement (summary + log in one `MULTI`/`EXEC`) adds implementation surface area.
+
+- Chosen mitigation or follow-up action:
+  - Replace the Redis step log with structured application-level logging (stdout/gunicorn).
+  - Recovery depends only on the tx summary record and the durable decision marker.
+  - Debugging intermediate steps uses application logs, which are cheap and don't add Redis pressure.
+  - Updated in `plan/phase1-rebuild-plan.md`: decision record revised.
+
+## 2026-03-05 - Three separate locking mechanisms create interaction surface area
+
+- Limitation encountered:
+  - The original plan defined three locks: request lease lock, active transaction guard, and prepared holds. Each has different lifetime, durability, and clearing semantics. The interactions between them (lease expires while guard is set, guard cleared while lease is held by another request) are a source of subtle correctness bugs.
+
+- Why the current design caused it:
+  - The lease lock and active-tx guard were designed to solve different problems (request mutual exclusion vs. transaction ownership), but in practice the active-tx guard already provides mutual exclusion.
+
+- Impact:
+  - **Consistency risk (medium)**: more locking primitives means more edge cases to reason about and test correctly.
+  - **Complexity risk**: three mechanisms interacting under crash, timeout, and concurrency scenarios is harder to verify than two.
+
+- Chosen mitigation or follow-up action:
+  - Merge the lease lock and active-tx guard into one mechanism: a durable active-tx pointer with TTL.
+  - `SET order_active_tx:{order_id} {tx_id} NX EX {ttl}` provides both mutual exclusion and durable ownership.
+  - TTL handles crash cleanup. Recovery worker handles stuck transactions.
+  - This reduces the locking model from three mechanisms to two (active-tx guard + prepared holds).
+  - Updated in `plan/phase1-rebuild-plan.md`: locking section revised.
+
+## 2026-03-05 - SAGA recovery direction after successful charge was unspecified
+
+- Limitation encountered:
+  - The plan did not specify whether SAGA recovery should complete forward or compensate backward when the transaction crashed after successfully charging payment but before marking the order as paid.
+
+- Why the current design caused it:
+  - The plan focused on the general compensation model without distinguishing recovery direction based on how far the saga progressed.
+
+- Impact:
+  - **Consistency risk (medium)**: compensating backward (refunding) after a successful charge risks the refund itself failing, leaving the system in a worse state. Completing forward (marking paid) is safer because the charge already happened.
+
+- Chosen mitigation or follow-up action:
+  - SAGA recovery completes forward after a successful charge.
+  - SAGA recovery compensates backward only when charge has not yet happened.
+  - Updated in `plan/phase1-rebuild-plan.md`: SAGA protocol section and recovery model updated.
+
+## 2026-03-05 - Stale-hold cleanup was underspecified without a coordinator query channel
+
+- Limitation encountered:
+  - The plan said participants should do "bounded stale-hold cleanup that respects known coordinator decisions" but participants have no direct access to coordinator state (which lives in a different Redis instance).
+
+- Why the current design caused it:
+  - The plan assumed participants could somehow know coordinator decisions without specifying the communication channel.
+
+- Impact:
+  - **Consistency risk (medium)**: a participant that unilaterally releases a prepared hold could violate a commit decision.
+  - **Availability risk**: without any cleanup mechanism, stale holds block resources indefinitely.
+
+- Chosen mitigation or follow-up action:
+  - Stale-hold cleanup is coordinator-driven: the recovery worker issues explicit abort calls.
+  - For participant-side startup reconciliation, the order service exposes `GET /internal/tx_decision/{tx_id}`.
+  - Participants never unilaterally abort holds when the decision is unknown.
+  - Updated in `plan/phase1-rebuild-plan.md`: participant and locking sections updated.
+
+## 2026-03-05 - 10-step implementation program was too granular for the timeline
+
+- Limitation encountered:
+  - The plan defined 10 implementation steps, each with detailed validation matrices and acceptance criteria. With 8 days until the Phase 1 deadline, this is roughly 1 step per day with no slack for debugging or rework.
+
+- Why the current design caused it:
+  - The plan was written defensively after two failed attempts, optimizing for process rigor over delivery speed.
+
+- Impact:
+  - **Delivery risk (high)**: the overhead of per-step validation ceremonies can consume more time than the implementation itself. Steps with no meaningful independent deliverable (e.g., "freeze the contract" as step 1, "build data model" as step 2) create artificial boundaries.
+
+- Chosen mitigation or follow-up action:
+  - Consolidated to 5 steps: (1) foundation + atomic participants, (2) coordinator + both protocols, (3) recovery, (4) validation + benchmarking, (5) fault tolerance.
+  - Same correctness gates, fewer artificial boundaries.
+  - Updated in `plan/phase1-rebuild-plan.md`: implementation program revised.
+
+## 2026-03-05 - Replica-safe recovery leader lock is premature for Phase 1
+
+- Limitation encountered:
+  - The plan required a distributed leader lock for the recovery worker to handle multiple `order` replicas. But docker-compose runs a single order-service instance and the benchmark runs locally.
+
+- Why the current design caused it:
+  - The plan was designed to handle horizontal scaling from the start, which is good long-term but premature when basic SAGA/2PC correctness doesn't exist yet.
+
+- Impact:
+  - **Delivery risk (medium)**: implementing and testing distributed leader election consumes time that should go toward getting basic protocol correctness working.
+
+- Chosen mitigation or follow-up action:
+  - Implement single-instance recovery first.
+  - Document the scaling limitation explicitly.
+  - Add the leader lock only if order service is actually scaled.
+  - Updated in `plan/phase1-rebuild-plan.md`: recovery model updated.
 
 ## Update Rules
 

@@ -53,16 +53,19 @@ Required outcomes:
 2. No protocol-specific data leaks into public response schemas.
 3. No Flask `abort()` calls inside protocol logic.
 4. No protocol module should directly construct Flask `Response` objects.
-5. No long polling loops in request handlers while holding lease locks.
+5. No long polling loops in request handlers while holding the active-tx guard.
 6. No duplicate copies of finalization or recovery logic.
 7. Redis remains the system of record for Phase 1.
 8. True XA is out of scope; 2PC is application-managed.
 9. App-level 2PC uses reservation-based prepared holds at participants, not timestamp ordering as the primary concurrency policy.
-10. Transaction state must not rely on summary flags alone; every checkout transaction also records an append-only step log.
-11. No message bus is used on the Phase 1 checkout critical path.
+10. Transaction state must not rely on summary flags alone; every checkout transaction also records structured application logs for intermediate steps and durable Redis records for critical decisions.
+11. RabbitMQ is used as the internal transport for coordinator↔participant communication. The external API remains synchronous.
 12. `POST /orders/checkout/{order_id}` returns `200` as an idempotent no-op when the order is already safely paid.
 13. Breaking storage schemas is acceptable during the rebuild because this is a proof-of-concept/MVP and production starts with empty state.
 14. Protocol mode is deployment-wide; all services in one running stack use the same transaction mode.
+15. All read-modify-write operations on participant state (stock, credit) must be atomic at the Redis level using Lua scripts or `WATCH`/`MULTI`/`EXEC`. Non-atomic `GET` then `SET` patterns are treated as correctness bugs.
+16. Internal transaction operations use RabbitMQ. Non-transactional lookups use direct service URLs. Nothing internal routes through the nginx gateway.
+17. Gunicorn worker counts must be tuned for the synchronous blocking call pattern; 2 workers is insufficient for any meaningful throughput.
 
 ## Explicit Decision Record
 
@@ -167,34 +170,99 @@ Why we are not doing that:
 2. It makes transaction semantics harder to reason about and defend.
 3. The deployment model for this project is explicitly uniform: the whole stack runs one mode per deployment.
 
-### Decision: Keep the checkout critical path synchronous and use direct internal HTTP
+### Decision: Use RabbitMQ as internal coordinator-to-participant transport with parallel fan-out
 
 Chosen:
 
-- internal service-to-service HTTP on the checkout hot path
-- no message bus on the Phase 1 critical path
+- use RabbitMQ for internal coordinator↔participant communication
+- the coordinator publishes prepare/commit/abort messages to stock and payment queues in parallel
+- participants consume messages, execute against Redis, and publish results to a reply queue
+- the coordinator consumes replies and makes the commit/abort decision
+- the external checkout API remains synchronous: the route blocks until the coordinator has a final result
+- stock and payment operations happen in parallel (not serial)
 
 Why:
 
-1. The public API must return a synchronous final `2xx/4xx` result.
-2. 2PC still needs a synchronous logical decision point even if a queue is used as transport.
-3. Queue hops add broker latency, scheduling delay, and reply coordination overhead.
-4. For a latency-sensitive synchronous checkout path, that complexity hurts more than it helps.
+1. The assignment explicitly rewards event-driven asynchronous architectures with extra points for difficulty.
+2. The lecturer heavily advises for a message broker.
+3. Parallel fan-out to stock and payment cuts checkout latency roughly in half compared to serial HTTP calls.
+4. RabbitMQ provides durable message delivery, which improves fault tolerance — messages survive broker restarts.
+5. The pattern naturally fits SAGA compensation (publish compensation messages on failure).
+6. It demonstrates more advanced distributed systems understanding during the evaluation interview.
+
+How the synchronous API works with async internals:
+
+1. `POST /orders/checkout/{order_id}` arrives at the order service.
+2. The coordinator creates a tx record, then publishes prepare/reserve messages to RabbitMQ.
+3. The coordinator blocks on a reply queue (with timeout) waiting for participant results.
+4. Once all results arrive, the coordinator decides and publishes commit/abort messages.
+5. The coordinator blocks on commit/abort confirmations.
+6. The route returns `2xx` or `4xx` to the client.
+
+The blocking wait on the reply queue is bounded by a timeout. If participants don't respond in time, the coordinator aborts (presumed abort for 2PC, compensation for SAGA).
+
+Why this is different from attempt 1 (which also used RabbitMQ):
+
+1. Attempt 1 used RabbitMQ as the sole orchestration mechanism with polling for the synchronous response. The checkout API published a message, then polled Redis for saga state — a hot-loop bottleneck.
+2. This design uses RabbitMQ as transport but keeps the coordinator as an in-process state machine that blocks on reply queues. No polling loop. The coordinator directly receives results via RabbitMQ's consumer model.
+3. Attempt 1 had no 2PC at all. This design uses the same message transport for both SAGA and 2PC.
+4. Attempt 1 used a separate order-worker process for orchestration. This design keeps the coordinator in-process in the order service, matching the Phase 2 extraction architecture.
+
+Lessons preserved from attempt 1:
+
+- Lua scripts for atomic participant operations (this worked well)
+- Idempotent participant handlers keyed by tx_id (this worked well)
+- Durable queues with persistent messages (this worked well)
+- Dead-letter queues for poison messages (adopt this)
+
+Lessons avoided from attempt 1:
+
+- No Redis polling loop for checkout response (use reply queue blocking instead)
+- No separate worker process (keep coordinator in-process)
+- No 7-day idempotency TTL (use shorter TTL appropriate for recovery window)
+- No complex retry queue topology (use simple DLQ + recovery worker re-publish)
 
 Alternative considered:
 
-- use a message bus for SAGA and 2PC
+- direct internal HTTP calls (the previous plan)
 
-Why we are not doing that now:
+Why we are moving away from that:
 
-1. A message bus is a natural fit for SAGA, but not for 2PC's synchronous vote/decision/finalization lifecycle.
-2. It can improve replayability and burst absorption, but it usually worsens tail latency on a synchronous request path.
-3. It recreates the risk from attempt 1: building a larger asynchronous platform before Phase 1 correctness is stable.
+1. Serial HTTP calls are the primary latency bottleneck for checkout.
+2. HTTP does not provide built-in retry/redelivery semantics.
+3. Direct HTTP does not qualify as event-driven architecture, which the assignment rewards.
+4. The lecturer explicitly advises for a message broker.
 
-Important nuance:
+Alternative considered:
 
-- a message bus is still a valid future Phase 2 or post-Phase-2 transport option, especially for async repair, retries, or higher-difficulty SAGA variants
-- it is intentionally excluded from the Phase 1 checkout hot path, not declared universally bad
+- parallel HTTP calls with ThreadPoolExecutor (no broker)
+
+Why that alone is insufficient:
+
+1. It achieves parallelism but not the event-driven architecture bonus.
+2. It provides no message durability — if a participant is temporarily down, the message is lost.
+3. It does not demonstrate the distributed systems patterns expected for difficulty scoring.
+4. ThreadPoolExecutor parallelism can still be used within the coordinator as an implementation detail if needed for non-message-based operations.
+
+### Decision: Parallel participant operations are the default execution model
+
+Chosen:
+
+- stock and payment prepare/reserve operations happen in parallel, not serial
+- stock and payment commit/abort operations happen in parallel, not serial
+- the coordinator publishes to both participant queues simultaneously and waits for both replies
+
+Why:
+
+1. Stock and payment are independent participants. There is no ordering dependency between them during prepare or commit.
+2. Parallel execution cuts the dominant latency cost (participant round trips) roughly in half.
+3. Both attempt 1 and attempt 2 used serial participant calls, which was the primary latency bottleneck.
+
+Ordering rules:
+
+- Within 2PC: parallel prepare → decision → parallel commit/abort. The decision is the serialization point.
+- Within SAGA: parallel reserve stock + charge payment → mark paid. On failure: parallel compensation (refund + release).
+- Item aggregation still happens before parallel dispatch — the coordinator aggregates duplicate items, then sends one message per participant (not per item).
 
 ### Decision: Use reservation-based strict 2PL semantics for 2PC participants
 
@@ -226,29 +294,57 @@ Allowed secondary use of counters:
 
 - monotonic transaction IDs
 - event sequence numbers
-- diagnostics and ordering within the tx log
+- diagnostics and ordering within application logs
 
-### Decision: Use a hybrid state model, not flags-only and not full event sourcing
+### Decision: Use a hybrid state model with lightweight observability
 
 Chosen:
 
-- one compact canonical tx summary record for fast-path reads
-- one append-only per-transaction step log for auditability and recovery reconstruction
+- one compact canonical tx summary record in Redis for fast-path reads and recovery decisions
+- durable Redis records only for the critical decision point (commit/abort decision) and the final outcome
+- structured application-level logging (stdout/gunicorn) for intermediate protocol steps
 
 Why:
 
 1. Summary records are efficient for the checkout hot path.
-2. The step log preserves the history needed for debugging and ambiguous crash recovery.
-3. This retains most of the benefits that prompted the event-sourcing discussion without forcing a full event-sourced architecture.
+2. The commit/abort decision is the only intermediate state that recovery truly needs to be durable — everything else can be re-derived from the summary record plus the decision.
+3. Application-level structured logging (with tx_id, step name, timestamp) provides the same debugging and auditability benefit as a per-tx Redis log, without the write overhead.
+4. Each real checkout would otherwise generate 6-10 durable Redis log writes. Under load, this materially increases latency and Redis pressure for information that is only needed during debugging, not during recovery.
+
+What is durably persisted in Redis:
+
+1. The canonical tx summary record (status, participant flags, decision).
+2. The commit/abort decision marker (`tx_decision:{tx_id}`).
+3. The commit fence (`order_commit_fence:{order_id}`).
+4. The active-tx guard (`order_active_tx:{order_id}`).
+
+What is logged to application logs only:
+
+1. Intermediate step transitions (prepare requested, prepared, commit requested, etc.).
+2. Timing and diagnostic metadata.
+3. Error context for failed operations.
+
+Recovery uses the durable summary record and decision marker. If the summary is ambiguous (e.g., crash between decision write and summary update), recovery checks the decision marker. This covers the same crash windows that the step log was designed for, with fewer moving parts.
 
 Alternative considered:
 
-- keep only summary flags/fields
+- full append-only per-transaction step log in Redis
 
 Why we are not doing that:
 
-1. Attempt 2 already exposed how compressed state can hide important recovery distinctions.
-2. It makes rollback and compensation bugs harder to understand and prove correct.
+1. It adds significant write overhead per checkout under load.
+2. Recovery only needs the decision point to resolve ambiguity, not the full step history.
+3. The atomic-write requirement (summary + log in one `MULTI`/`EXEC`) adds implementation complexity for marginal recovery benefit.
+4. Application logs provide the same debugging value without the performance cost.
+
+Alternative considered:
+
+- keep only summary flags/fields with no logging
+
+Why we are not doing that:
+
+1. Intermediate step visibility is valuable for debugging compensation and rollback bugs.
+2. Structured application logs are cheap and provide this without durable write overhead.
 
 Alternative considered:
 
@@ -259,6 +355,82 @@ Why we are not doing that:
 1. It would require rebuilding the services around event replay semantics instead of simple materialized state.
 2. It adds substantial complexity to reads, testing, and invariants.
 3. It is unnecessary for Phase 1 and would again risk solving the wrong problem first.
+
+### Decision: All participant read-modify-write operations must be Redis-atomic
+
+Chosen:
+
+- every operation that reads a value, modifies it, and writes it back must use a Lua script or `WATCH`/`MULTI`/`EXEC`
+- this applies to both public endpoints (`/stock/subtract`, `/payment/pay`, `/stock/add`, `/payment/add_funds`) and internal transaction endpoints
+
+Why:
+
+1. The current template code does `GET` then `SET` without any atomicity guard.
+2. Two concurrent `subtract` calls can both read `stock=10`, both compute `stock=9`, and both write `9`, silently losing inventory.
+3. Under benchmark load, this is not a theoretical risk — it will cause consistency failures immediately.
+4. This is a prerequisite for any meaningful consistency guarantee, independent of SAGA or 2PC.
+
+Preferred approach:
+
+- use Lua scripts for participant-side atomic operations because they are simpler and faster than `WATCH`/`MULTI`/`EXEC` retry loops
+- a Lua script for subtract: read current value, check sufficient quantity, decrement, write, return result — all in one atomic step
+- this eliminates the race window entirely rather than adding retry logic around it
+
+Alternative considered:
+
+- `WATCH`/`MULTI`/`EXEC` optimistic locking
+
+Why Lua scripts are preferred:
+
+1. `WATCH` requires a retry loop on contention, which adds code complexity and latency variance.
+2. Lua scripts execute atomically on the Redis server with no contention retries needed.
+3. They are the standard Redis pattern for conditional read-modify-write.
+
+### Decision: Internal transaction operations use RabbitMQ; non-transactional lookups use direct HTTP
+
+Chosen:
+
+- all coordinator↔participant transaction operations (prepare, commit, abort, reserve, release, charge, refund) go through RabbitMQ
+- non-transactional lookups that the checkout route needs before entering the coordinator (e.g., order read, item price lookup for `addItem`) use direct HTTP to the relevant service, bypassing the nginx gateway
+- the nginx gateway is only used for external client traffic
+
+Why:
+
+1. Transaction operations benefit from RabbitMQ's durability, parallel fan-out, and retry semantics.
+2. Simple read operations (find item, find user) don't need message broker overhead — direct HTTP is faster for synchronous lookups.
+3. Routing any internal call through nginx adds unnecessary latency.
+
+Implementation:
+
+- add `STOCK_SERVICE_URL` and `PAYMENT_SERVICE_URL` to docker-compose environment for the order service (for non-transactional HTTP lookups)
+- add `ORDER_SERVICE_URL` to docker-compose environment for stock and payment services (for `GET /internal/tx_decision/{tx_id}` queries during startup reconciliation)
+- add `RABBITMQ_URL` to all services for message broker connectivity
+- keep `GATEWAY_URL` only if any path genuinely requires external gateway routing
+
+### Decision: Gunicorn worker count must match the synchronous blocking architecture
+
+Chosen:
+
+- set gunicorn workers to at least `8` for the order service and `4` for stock and payment services in docker-compose
+- these are starting values; tune further based on benchmark results
+
+Why:
+
+1. The current configuration uses `-w 2` for all services.
+2. The checkout path makes synchronous blocking HTTP calls to participants. Each gunicorn worker is blocked for the entire duration of those calls.
+3. With 2 workers, the order service can process at most 2 concurrent checkouts. Under the benchmark's concurrent load, this is the primary throughput bottleneck.
+4. The plan targets ~10,000 requests/second. Even the already-paid fast path needs enough workers to accept concurrent connections.
+
+Alternative considered:
+
+- switch to async workers (gevent or eventlet)
+
+Why we are not doing that now:
+
+1. Async workers require careful attention to Redis client compatibility and connection pooling.
+2. They change the concurrency model in ways that affect lock behavior and recovery reasoning.
+3. Increasing sync worker count is a simpler first step that can be done immediately.
+4. Async workers remain a valid later optimization if sync workers prove insufficient.
 
 ### Decision: Keep recovery primarily in the background, not in request-time healing loops
 
@@ -333,29 +505,82 @@ Why we are not doing that:
 1. Strong focus on idempotency and failure recovery.
 2. Explicit transaction thinking instead of best-effort rollback only.
 3. Documenting assumptions and operational constraints.
+4. Lua scripts for atomic participant operations (stock_reserve, payment_charge, etc.) — these were correct and well-designed.
+5. Inbox + effect markers for idempotency within Lua scripts.
+6. Thread-local RabbitMQ publisher connections (avoids pika channel-sharing bugs).
+7. Durable queues with persistent messages (delivery_mode=2).
+8. Dead-letter queues for poison messages.
+9. Leader-locked reconciliation worker.
 
 ### What failed in attempt 1
 
-1. It solved a later-phase architecture problem first.
-2. It relied on RabbitMQ-centered saga orchestration instead of Flask + Redis only.
-3. It never delivered the required 2PC implementation.
+1. It solved a later-phase architecture problem first (built full async platform before basic correctness).
+2. Checkout API used a Redis polling loop to wait for saga completion — this was a hot-loop bottleneck under load (~2% duplicate-order failures at 10k users).
+3. It never delivered the required 2PC implementation (only SAGA).
+4. Used a separate order-worker process for orchestration, which made the coordinator harder to reason about than an in-process coordinator.
+5. 7-day TTL on idempotency markers was unnecessarily long and created edge-case risks.
+6. Complex retry-queue topology (main → retry → main with x-death counting) added operational complexity for marginal benefit over simpler DLQ + recovery re-publish.
+
+### What this rebuild takes from attempt 1
+
+1. Lua script patterns for atomic participant operations.
+2. Thread-local publisher connections.
+3. Durable persistent messages.
+4. DLQ for unprocessable messages.
+5. Idempotent participant handlers keyed by tx_id.
+
+### What this rebuild avoids from attempt 1
+
+1. No Redis polling loop — coordinator blocks on RabbitMQ reply queue instead.
+2. No separate worker process — coordinator is in-process in the order service.
+3. No complex retry-queue topology — DLQ + recovery worker re-publish is simpler and sufficient.
+4. Shorter idempotency marker TTL (1 hour, not 7 days).
+5. 2PC is implemented from the start, not deferred.
 
 ### What worked in attempt 2
 
 1. Startup protocol toggle (`saga` vs `2pc`).
 2. Canonical transaction record in the order-side store.
-3. Idempotent participant endpoints keyed by `tx_id`.
+3. Idempotent participant endpoints keyed by `tx_id` with Lua scripts.
 4. Per-order lock plus deterministic item ordering.
 5. Commit-fence handling for post-decision crashes.
 6. Background recovery with bounded request-time healing only where necessary.
+7. Presumed-abort policy for 2PC when no durable commit decision exists.
+8. Leader-locked recovery worker for multi-replica safety.
+9. Detailed state machine with explicit status transitions.
 
 ### What failed in attempt 2
 
-1. The order service became both domain service and coordinator.
-2. Route handlers mixed HTTP, locking, transaction orchestration, and recovery.
-3. Protocol modules were tied to Flask and order persistence.
-4. 2PC finalization logic was spread across multiple places.
-5. Recovery knew too much about protocol internals instead of resuming through one coordinator API.
+1. The order service became both domain service and coordinator — route handlers mixed HTTP, locking, transaction orchestration, and recovery.
+2. Protocol modules were tied to Flask and order persistence.
+3. 2PC finalization logic was spread across multiple places.
+4. Recovery knew too much about protocol internals instead of resuming through one coordinator API.
+5. **Critical bug**: `FAILED_NEEDS_RECOVERY` was classified as terminal in `is_terminal_status()`, which cleared the active-tx guard and allowed a second concurrent checkout to start while the first was still recovering. This caused duplicate charges/stock drift.
+6. Serial participant calls (stock → payment) were the dominant latency bottleneck.
+7. Internal calls routed through the nginx gateway added unnecessary overhead.
+8. Only 2 gunicorn workers per service — severe throughput limitation.
+9. Request-path healing loops originally had sleep/poll that could outlive lock leases, creating race conditions.
+10. Recovery was added late (commit `8cde8d9`) after the main protocol was already written, leading to immediate recovery-state bugs (fixed in `5bd4c5b`).
+
+### What this rebuild takes from attempt 2
+
+1. The state machine design (SAGA and 2PC status transitions).
+2. Canonical tx summary record with participant progress flags.
+3. Commit-fence mechanism for post-decision crash recovery.
+4. Presumed-abort policy for 2PC.
+5. Active-tx guard to prevent concurrent checkouts on the same order.
+6. Bounded request-time healing only for the commit-fence case.
+7. Lua-based atomic participant operations.
+
+### What this rebuild avoids from attempt 2
+
+1. No serial participant calls — parallel via RabbitMQ.
+2. `FAILED_NEEDS_RECOVERY` is explicitly NOT terminal and does NOT clear the active-tx guard.
+3. No gateway hairpinning for internal calls.
+4. Adequate gunicorn worker counts from the start.
+5. Recovery is designed alongside the protocol, not added afterward.
+6. The coordinator is a separate code boundary from Flask routes from the beginning, not refactored later.
+7. No request-path sleep/poll loops — return `409` immediately for active non-terminal transactions.
 
 ### Specific failure patterns observed from attempt 2 planning and design notes
 
@@ -487,16 +712,32 @@ Looking at the branch history from `901934d` through `5bd4c5b` reveals additiona
 
 Phase 1 runtime shape:
 
+- `RabbitMQ` broker:
+  - durable queues for stock and payment commands
+  - reply queues for coordinator to receive participant results
+  - dead-letter queues for poison messages
 - `order` service hosts:
-  - public order API
-  - embedded coordinator
-  - background recovery worker
+  - public order API (Flask + gunicorn)
+  - embedded coordinator (publishes commands to RabbitMQ, consumes replies)
+  - background recovery worker (re-publishes stale transactions)
+  - RabbitMQ publisher connection (thread-local, as attempt 1 correctly did)
 - `payment` service hosts:
-  - public payment API
-  - internal transaction participant API
+  - public payment API (Flask + gunicorn)
+  - RabbitMQ consumer for transaction commands (prepare, commit, abort, charge, refund)
+  - publishes results back to coordinator reply queue
 - `stock` service hosts:
-  - public stock API
-  - internal transaction participant API
+  - public stock API (Flask + gunicorn)
+  - RabbitMQ consumer for transaction commands (prepare, commit, abort, reserve, release)
+  - publishes results back to coordinator reply queue
+
+Message topology:
+
+- `stock.commands` queue (durable) — coordinator publishes stock prepare/commit/abort/reserve/release
+- `payment.commands` queue (durable) — coordinator publishes payment prepare/commit/abort/charge/refund
+- `coordinator.replies` queue (durable) — participants publish results back to coordinator
+- `*.dlq` queues — dead-letter queues for unprocessable messages
+- all messages are persistent (delivery_mode=2)
+- all messages carry `tx_id` and `correlation_id` for routing and idempotency
 
 Code boundaries:
 
@@ -508,18 +749,25 @@ Code boundaries:
    - protocol selection
    - transaction state transitions
    - recovery entrypoints
+   - message publishing and reply consumption
    - no Flask imports
 3. Protocol layer:
    - `SagaProtocol`
    - `TwoPhaseCommitProtocol`
    - common interface
+   - both protocols publish to the same participant queues, just with different command types
 4. Domain/storage layer:
    - order persistence
    - transaction persistence
    - participant local transaction persistence
-5. Adapter layer:
-   - HTTP clients to participant services
-   - internal participant route handlers
+5. Messaging layer:
+   - RabbitMQ connection management (publisher and consumer)
+   - message serialization/deserialization
+   - reply correlation
+6. Participant worker layer:
+   - RabbitMQ consumers in stock and payment services
+   - dispatch incoming commands to Lua-based atomic operations
+   - publish results to reply queue
 
 ## Recommended File Structure
 
@@ -527,48 +775,54 @@ Target structure for the rebuild:
 
 ```text
 common/
-  http.py
-  redis_lock.py
-  result.py
+  messaging.py        # RabbitMQ connection, publish, consume helpers
+  result.py           # Structured result types
+  models.py           # Shared message contracts (command types, reply types)
 
 coordinator/
-  models.py
-  ports.py
-  service.py
-  recovery.py
+  models.py           # CheckoutTxValue, status constants
+  ports.py            # Abstract participant interface
+  service.py          # CoordinatorService: execute_checkout, resume_transaction
+  recovery.py         # Background recovery worker
+  messaging.py        # Publish commands, consume replies, correlation
   protocols/
-    base.py
-    saga.py
-    two_pc.py
+    base.py           # Common protocol interface
+    saga.py           # SAGA: parallel reserve+charge → compensate on failure
+    two_pc.py         # 2PC: parallel prepare → decision → parallel commit/abort
 
 order/
-  app.py
+  app.py              # Flask app, starts recovery worker + RabbitMQ connections
   routes/
-    public.py
-  domain.py
-  store.py
+    public.py         # Checkout, order CRUD
+    internal.py       # GET /internal/tx_decision/{tx_id}
+  domain.py           # Order business logic
+  store.py            # Order + tx persistence in Redis
 
 payment/
-  app.py
+  app.py              # Flask app + RabbitMQ consumer startup
   routes/
-    public.py
-    internal.py
-  domain.py
-  tx_store.py
+    public.py         # Payment CRUD (create_user, find_user, add_funds)
+  worker.py           # RabbitMQ consumer: dispatch commands to service
+  service.py          # Atomic Lua-based pay/refund/prepare/commit/abort
+  lua_scripts.py      # Lua script definitions
+  tx_store.py         # Participant tx record persistence
 
 stock/
-  app.py
+  app.py              # Flask app + RabbitMQ consumer startup
   routes/
-    public.py
-    internal.py
-  domain.py
-  tx_store.py
+    public.py         # Stock CRUD (create, find, add, subtract)
+  worker.py           # RabbitMQ consumer: dispatch commands to service
+  service.py          # Atomic Lua-based reserve/release/prepare/commit/abort
+  lua_scripts.py      # Lua script definitions
+  tx_store.py         # Participant tx record persistence
 ```
 
-The important constraint is architectural, not naming:
+The important constraints are architectural, not naming:
 
 - `coordinator/` must not depend on Flask
 - `coordinator/` must depend on interfaces/ports, not concrete route modules
+- participant workers consume from RabbitMQ and call Lua scripts — they do not import Flask
+- the messaging layer is shared but transport-agnostic enough that Phase 2 can replace RabbitMQ with another broker or direct HTTP if needed
 
 ## Data Model
 
@@ -605,70 +859,36 @@ One durable coordinator record per checkout transaction:
 
 This record is the fast-path materialized view used by the coordinator during normal execution.
 
-### Append-Only Transaction Step Log
+### Structured Application Logging for Protocol Steps
 
-Each checkout transaction also keeps an append-only per-transaction step log.
+Intermediate protocol steps are logged via structured application logging (stdout/gunicorn), not persisted in Redis.
 
-Recommended event types:
+Recommended log fields per entry:
 
-- `tx_created`
-- `stock_prepare_requested`
-- `stock_prepared`
-- `stock_prepare_rejected`
-- `payment_prepare_requested`
-- `payment_prepared`
-- `payment_prepare_rejected`
-- `decision_commit`
-- `decision_abort`
-- `stock_commit_requested`
-- `stock_committed`
-- `payment_commit_requested`
-- `payment_committed`
-- `stock_abort_requested`
-- `stock_aborted`
-- `payment_abort_requested`
-- `payment_aborted`
-- `saga_reserve_requested`
-- `saga_reserved`
-- `saga_charge_requested`
-- `saga_charged`
-- `saga_refund_requested`
-- `saga_refunded`
-- `saga_release_requested`
-- `saga_released`
-- `order_marked_paid`
-- `tx_completed`
-- `tx_failed_needs_recovery`
-
-Each log entry should include:
-
-- `sequence`
 - `tx_id`
-- `event_type`
+- `step` (e.g., `stock_prepare_requested`, `payment_charged`, `decision_commit`)
 - `timestamp`
-- `actor`
-- `details`
+- `result` (success, failure, timeout)
+- `details` (error messages, participant responses)
 
-Storage guidance:
+This provides debugging and auditability without the write overhead of a per-transaction Redis log.
 
-1. Keep the log per transaction, not as one global stream for Phase 1.
-2. Append and summary-state mutation must be committed in one atomic write unit when they describe the same transition.
-3. Use the canonical tx record for current-state reads.
-4. Use the step log for auditability, recovery reconstruction, and debugging ambiguous crash windows.
+Recovery does not depend on these logs. Recovery uses only:
 
-Implementation rule:
+1. The canonical tx summary record (`tx:{tx_id}`).
+2. The durable decision marker (`tx_decision:{tx_id}`).
+3. The commit fence (`order_commit_fence:{order_id}`).
 
-- do not allow "log says step happened, summary says it did not" or the reverse for the same transition
+If the summary record is ambiguous after a crash (e.g., participants were called but status was not updated), recovery checks the decision marker to determine whether to complete forward or abort.
 
 ### Coordinator Metadata
 
 Keep orchestration metadata separate from domain records:
 
-- `order_active_tx:{order_id}`
-- `tx:{tx_id}`
-- `tx_decision:{tx_id}`
-- `order_commit_fence:{order_id}`
-- `checkout_lock:{order_id}`
+- `order_active_tx:{order_id}` — durable active transaction guard with TTL (replaces both the old lease lock and active-tx guard)
+- `tx:{tx_id}` — canonical transaction summary record
+- `tx_decision:{tx_id}` — durable commit/abort decision marker
+- `order_commit_fence:{order_id}` — commit fence for post-decision crash recovery
 
 This avoids hiding domain state and coordinator state behind one mixed persistence surface.
 
@@ -682,14 +902,43 @@ Each participant stores per-transaction state by `tx_id`:
 - committed/applied flag
 - aborted/reversed flag
 - timestamps
-- optional expiry metadata for abandoned prepared holds
 
 Participant operations must be idempotent by `tx_id`.
 
-Participants should also support:
+### Participant Atomic Operations
 
-- startup reconciliation of non-terminal local tx records
-- bounded stale-hold cleanup that never violates a known coordinator decision
+All participant read-modify-write operations must be implemented as Lua scripts executed on the Redis server. This includes:
+
+- public endpoints: `/stock/subtract`, `/stock/add`, `/payment/pay`, `/payment/add_funds`
+- internal transaction endpoints: prepare, commit, abort for both 2PC and SAGA
+
+Example Lua script pattern for stock subtract:
+
+```lua
+local key = KEYS[1]
+local amount = tonumber(ARGV[1])
+local data = redis.call('GET', key)
+if not data then return redis.error_reply('not found') end
+-- decode, check, modify, encode, set — all atomic
+```
+
+The specific encoding/decoding depends on the serialization format (msgspec msgpack). The key requirement is that the read, check, modify, write cycle happens in a single atomic Redis operation with no window for concurrent interleaving.
+
+### Stale-Hold Cleanup
+
+Stale prepared holds are cleaned up by the coordinator's recovery worker, not unilaterally by participants.
+
+Why:
+
+1. Participants cannot know whether the coordinator decided to commit or abort a transaction.
+2. A participant that times out and releases a prepared hold could violate a commit decision.
+3. The coordinator has the authoritative decision state and can safely issue `abort` calls.
+
+If a participant needs to query the coordinator's decision (e.g., during startup reconciliation), the order service exposes:
+
+- `GET /internal/tx_decision/{tx_id}` — returns `commit`, `abort`, or `unknown`
+
+Participants may use this during startup to reconcile non-terminal local tx records, but they must not unilaterally abort holds when the answer is `unknown`.
 
 ## Core Invariants
 
@@ -745,31 +994,35 @@ It should not be used as the main conflict-resolution policy for checkout execut
 
 ## Locking and Guard Responsibilities
 
-Three mechanisms exist and they serve different purposes.
+Two mechanisms exist and they serve different purposes.
 
-### Request Lease Lock
+### Active Transaction Guard (with TTL)
 
-The per-order lease lock is short-lived request-path mutual exclusion.
-
-Its job is:
-
-- stop two checkout handlers from actively coordinating the same order at the same time
-
-Its job is not:
-
-- represent durable prepared state
-- represent transaction ownership after a crash
-- replace the active transaction guard
-
-### Active Transaction Guard
-
-The active transaction guard is a durable pointer from order to the current in-flight checkout transaction.
+The active transaction guard (`order_active_tx:{order_id}`) is a durable pointer from order to the current in-flight checkout transaction, stored in Redis with a TTL.
 
 Its job is:
 
 - prevent a new checkout from starting while an earlier transaction is still non-terminal or not yet safe to re-enter
+- provide request-path mutual exclusion (replaces the need for a separate lease lock)
 
-It must outlive request crashes and must not be cleared only because a lease lock expired.
+It must outlive individual requests and must not be cleared except when the transaction reaches a safe-to-reenter terminal state.
+
+The TTL serves as a safety net: if the coordinator crashes without cleaning up, the guard expires after a bounded time, allowing the recovery worker to take over. The TTL should be generous (e.g., 30-60 seconds) — long enough that it never expires during normal operation, short enough that crashed transactions don't block forever.
+
+Why a single mechanism instead of separate lease lock + active-tx guard:
+
+1. Two locking mechanisms with different lifetimes create interaction bugs (lease expires while guard is still set, guard cleared while lease is held by another request, etc.).
+2. The active-tx guard already prevents concurrent checkouts. A separate lease lock's only advantage is self-expiry on crash — but a TTL on the guard achieves the same thing.
+3. The recovery worker handles stuck transactions regardless, so the TTL is defense-in-depth, not the primary recovery mechanism.
+4. Fewer locking primitives means fewer correctness edge cases to reason about and test.
+
+Implementation:
+
+- use `SET order_active_tx:{order_id} {tx_id} NX EX {ttl}` to atomically acquire
+- the `NX` flag prevents concurrent acquisition
+- refresh the TTL during long operations if needed
+- clear explicitly on terminal state
+- recovery worker picks up expired guards
 
 ### Prepared Holds
 
@@ -782,20 +1035,25 @@ Their job is:
 
 Prepared holds are part of transaction durability, not request mutual exclusion.
 
+Cleanup of stale prepared holds is coordinator-driven: the recovery worker on the order service detects non-terminal transactions and issues explicit `abort` calls to participants. Participants must not unilaterally clean up their own holds based on timeouts, because they cannot know whether the coordinator decided to commit. If a participant needs to query the coordinator's decision, the order service exposes `GET /internal/tx_decision/{tx_id}` which returns the durable decision (commit, abort, or unknown).
+
 ## Performance Strategy
 
 Phase 1 prioritizes raw request throughput on the benchmark-visible path while preserving correctness.
 
 The practical strategy is:
 
-1. Keep the checkout path synchronous and avoid a message bus on the hot path.
-2. Make the already-paid `200` path extremely cheap.
-3. Minimize Redis round trips and HTTP calls for real checkout work.
+1. Use RabbitMQ for parallel fan-out to stock and payment. This cuts the dominant latency cost (participant round trips) roughly in half compared to serial HTTP calls.
+2. Make the already-paid `200` path extremely cheap — pure Redis read, no RabbitMQ interaction.
+3. Minimize Redis round trips per participant operation. Lua scripts do read-check-modify-write in one atomic step.
 4. Keep long-running recovery and reconciliation out of request threads.
-5. Use direct service-to-service calls, not internal gateway hairpins.
-6. Use connection reuse for all internal HTTP clients.
-7. Keep serialization and Redis payloads compact.
+5. Use direct HTTP (bypassing nginx) only for non-transactional lookups (item price, user info). All transaction operations go through RabbitMQ.
+6. Use persistent RabbitMQ connections with channel pooling. Use `requests.Session` with connection pooling for any remaining HTTP calls.
+7. Keep serialization and Redis/message payloads compact (msgspec msgpack for Redis, JSON or msgpack for RabbitMQ messages).
 8. Fail fast on overload or ambiguity instead of stalling enough requests to blow the latency budget.
+9. Use Lua scripts for all participant-side atomic operations. This is both a correctness and performance requirement.
+10. Set gunicorn worker counts high enough for the architecture. Starting values: `8` workers for order, `4` for stock and payment. Tune based on benchmark results.
+11. Send one message per participant per protocol phase, not one message per item. The stock message contains the full aggregated item list; the stock service processes all items in one Lua script invocation.
 
 Two performance metrics must be tracked separately:
 
@@ -836,11 +1094,12 @@ That means:
 1. The already-paid fast path must be near-minimal:
    - one lightweight read path
    - immediate `200`
-2. The real checkout path must avoid avoidable extra hops:
-   - no queue broker
-   - no gateway hairpin
+2. The real checkout path benefits from parallel participant operations via RabbitMQ:
+   - publish prepare/reserve to stock and payment simultaneously
+   - wait for both replies in parallel
+   - no gateway hairpin for any internal call
    - no duplicate state writes
-3. Any design that turns one logical transition into many separate remote operations is suspect.
+3. Any design that turns one logical transition into many separate serial remote operations is suspect. Parallel fan-out is the mitigation.
 
 ## Fast Already-Paid Path
 
@@ -851,8 +1110,7 @@ Fast-path rule:
 1. Read a lightweight order summary first.
 2. If `paid == true` and there is no active transaction and no commit fence, return `200` immediately.
 3. Do not create a new checkout tx for that no-op case.
-4. Do not append a tx step-log entry for that no-op case.
-5. Only enter full coordination for unpaid or ambiguous orders.
+4. Only enter full coordination for unpaid or ambiguous orders.
 
 This improves headline throughput while preserving the idempotent API contract.
 
@@ -873,8 +1131,8 @@ Rules:
 
 1. Aggregate duplicate order lines by `item_id` before protocol execution.
 2. Protocols operate on the aggregated item snapshot, not the raw order line list.
-3. Prefer batched internal stock operations per transaction over one HTTP round trip per raw line item.
-4. The tx step log should record meaningful transition boundaries, not one verbose event per raw line item unless required for recovery.
+3. Prefer batched internal stock operations per transaction. Send one message to the stock service containing the full aggregated item list, not one message per item.
+4. Application-level structured logs should record meaningful transition boundaries, not one verbose event per raw line item.
 5. If the external benchmark can generate pathologically large orders, that should be treated as a performance risk to design around, not as a harmless corner case.
 
 If internal batching is not implemented immediately, the plan must assume order-size limits will materially affect latency.
@@ -882,7 +1140,7 @@ If internal batching is not implemented immediately, the plan must assume order-
 Why this matters:
 
 1. The benchmark's create-order scenario can produce very large orders because it randomly picks an item count from a wide seeded range.
-2. A naive "one remote call per line item" protocol path will collapse under such inputs.
+2. A naive "one message per line item" protocol path will collapse under such inputs.
 3. Logging every tiny step can become as expensive as the business work itself.
 
 ## Request Flow
@@ -891,12 +1149,12 @@ The `POST /orders/checkout/{order_id}` route should do only this:
 
 1. Validate the order exists.
 2. Check the fast already-paid path using lightweight summary state.
-3. Acquire the per-order lock for unpaid or ambiguous orders.
-4. Reject with `409` if a non-terminal active transaction already exists.
+3. Acquire the active-tx guard (`SET order_active_tx:{order_id} {tx_id} NX EX {ttl}`) for unpaid or ambiguous orders.
+4. If acquisition fails, check whether the existing active tx is still live or expired/terminal. Reject with `409` if a non-terminal active transaction already exists.
 5. Create a canonical transaction record before the first participant call.
 6. Call `CoordinatorService.execute_checkout(...)`.
 7. Translate the structured result into `2xx` or `4xx`.
-8. Release the lock.
+8. Clear the active-tx guard on terminal state.
 
 The route must not contain protocol logic.
 
@@ -913,41 +1171,52 @@ The route also must not:
 Success path:
 
 1. Persist `INIT`.
-2. Reserve stock from the aggregated deterministic item snapshot.
-3. Charge payment.
-4. Mark order paid.
-5. Mark transaction completed.
+2. Publish reserve-stock and charge-payment commands **in parallel** to RabbitMQ (one message to stock queue, one to payment queue, both containing aggregated item/amount data).
+3. Wait for both participant replies on the coordinator reply queue (bounded timeout).
+4. If both succeed: mark order paid, mark transaction completed.
 
 Failure path:
 
-1. Persist compensation state before compensating.
-2. Reverse payment if already charged.
-3. Release stock in reverse durable order.
-4. Mark terminal abort/failure state.
+1. If stock reserve fails but payment charge succeeded: publish refund command to payment. Wait for confirmation. Mark aborted.
+2. If payment charge fails but stock reserve succeeded: publish release command to stock. Wait for confirmation. Mark aborted.
+3. If both fail: mark aborted (no compensation needed).
+4. If a participant times out (no reply within deadline): treat as failure for that participant. Compensate the other if it succeeded. Mark `FAILED_NEEDS_RECOVERY` if compensation also fails.
+
+Recovery policy:
+
+- If the tx summary shows stock reserved and payment charged but the order is not yet marked paid, recovery **completes forward** (marks paid and completes the transaction). The charge already happened; reversing it risks the refund failing, which would leave the system in a worse state than completing forward.
+- If the tx summary shows stock reserved but payment not yet charged (or timed out), recovery compensates backward (publishes release to stock, marks aborted).
+- If the tx summary shows payment charged but stock not reserved (or timed out), recovery compensates backward (publishes refund to payment, marks aborted).
+- Both partial-success cases are possible because stock and payment execute in parallel.
+- Compensation operations (refund, release) must be idempotent so that replayed recovery is safe.
 
 ### App-Level 2PC
 
 Success path:
 
 1. Persist `INIT`.
-2. Prepare stock participants by creating durable stock reservations from the aggregated item snapshot.
-3. Prepare payment participant by creating a durable funds hold.
-4. Persist durable commit decision.
-5. Set commit fence.
-6. Commit stock by consuming the prepared reservations.
-7. Commit payment by consuming the prepared funds hold.
+2. Publish prepare commands to stock and payment **in parallel** via RabbitMQ (stock prepare with aggregated items, payment prepare with user_id and total_cost).
+3. Wait for both prepare replies on the coordinator reply queue (bounded timeout).
+4. If both prepared successfully: persist durable commit decision (`tx_decision:{tx_id} = commit`).
+5. Set commit fence (`order_commit_fence:{order_id} = tx_id`).
+6. Publish commit commands to stock and payment **in parallel** via RabbitMQ.
+7. Wait for both commit confirmations.
 8. Finalize order as paid.
 9. Clear fence and mark completed.
 
 Failure path:
 
-1. Persist durable abort decision where possible.
-2. Abort all prepared participants by releasing their prepared holds.
-3. Mark terminal abort state.
+1. If either prepare fails or times out: persist durable abort decision.
+2. Publish abort commands to all participants that may have prepared (in parallel).
+3. Wait for abort confirmations.
+4. Mark terminal abort state.
 
 Recovery policy:
 
-- presumed abort when no durable commit decision exists
+- Presumed abort when no durable commit decision exists.
+- If commit decision exists but commits are incomplete: re-publish commit commands. Participants are idempotent by tx_id, so re-delivery is safe.
+- If commit fence exists but order is not yet marked paid: complete forward (mark paid, clear fence).
+- Timeout on prepare reply is treated as "unknown, possibly prepared" — abort is the safe choice because no commit decision has been written yet.
 
 ## Recovery Model
 
@@ -958,16 +1227,18 @@ Rules:
 1. The recovery worker scans all non-terminal transactions on startup.
 2. It runs periodically afterward.
 3. It resumes work by calling a coordinator recovery entrypoint, not by reimplementing protocol logic in route code.
-4. Request-time healing is limited to 2PC finalization after a known commit decision.
-5. All other long-running repair happens in background recovery.
-6. Recovery should consult the canonical tx record first and the append-only step log when the summary state is ambiguous.
-7. If multiple `order` replicas run, only one recovery worker may actively scan and resume transactions at a time.
+4. Recovery re-publishes commands to RabbitMQ (commit, abort, compensate) the same way the normal checkout path does. Participants are idempotent by tx_id, so re-delivery is safe.
+5. Request-time healing is limited to 2PC finalization after a known commit decision (the commit-fence case).
+6. All other long-running repair happens in background recovery.
+7. Recovery consults the canonical tx summary record first, then the durable decision marker (`tx_decision:{tx_id}`) when the summary is ambiguous.
 
 This keeps synchronous request handling bounded while still satisfying consistency requirements.
 
-Replica-safety rule:
+Replica-safety:
 
-- use a distributed leader lock for the recovery worker when `order` is horizontally scaled
+- Phase 1 runs a single `order` service instance. The recovery worker does not need a distributed leader lock.
+- If horizontal scaling is added later, a distributed leader lock should be introduced at that point.
+- This is documented as a known scaling limitation, not deferred indefinitely — but implementing and testing leader election before the basic protocol works is premature.
 
 Additional recovery principles:
 
@@ -975,6 +1246,7 @@ Additional recovery principles:
 2. Recovery is allowed to be conservative and slower than the request path.
 3. Recovery must prefer invariant safety over fast unblocking.
 4. If recovery and normal request handling disagree, the durable transaction state wins over in-memory assumptions.
+5. SAGA recovery completes forward after a successful charge (see SAGA protocol section). It only compensates backward on explicit failures or when charge has not yet happened.
 
 ## Engineering Quality Rules
 
@@ -1035,308 +1307,242 @@ No implementation step is complete until all three categories below are satisfie
 
 ## Implementation Program
 
-Each step below defines:
+The program is organized into 5 consolidated steps. Each step produces working, testable code.
 
-1. what should happen in that step
-2. how the step must be validated
-3. what acceptance criteria must be met before moving forward
+The previous 10-step program was too granular for the available timeline. This consolidation merges steps that have no meaningful independent deliverable and reduces per-step ceremony while preserving the same correctness gates.
 
-### Step 1: Freeze the implementation contract and architecture skeleton
+### Step 1: Foundation — atomic participants, RabbitMQ, data model, and deployment fixes
 
 What should happen:
 
-1. Keep all public route signatures and response classes unchanged.
-2. Create or update the architecture scaffolding:
-   - `coordinator/`
-   - protocol interfaces
-   - result types
-   - storage port interfaces
-3. Establish the deployment-wide protocol configuration contract.
-4. Record the clean-slate schema assumption in code comments or config docs where the protocol mode is defined.
+1. Fix all participant read-modify-write operations to use Lua scripts:
+   - `/stock/subtract`, `/stock/add` — atomic stock modification
+   - `/payment/pay`, `/payment/add_funds` — atomic credit modification
+   - This is the highest-priority correctness fix; without it, no higher-level protocol matters.
+2. Add RabbitMQ to docker-compose:
+   - use `rabbitmq:3-management` image for local development (includes management UI for debugging)
+   - configure durable queues: `stock.commands`, `payment.commands`, `coordinator.replies`
+   - configure dead-letter queues: `stock.commands.dlq`, `payment.commands.dlq`
+   - all messages persistent (delivery_mode=2)
+   - add `RABBITMQ_URL` environment variable to all services
+3. Implement the shared messaging layer:
+   - RabbitMQ connection helpers (connect, publish, consume)
+   - message contracts (command types: prepare, commit, abort, reserve, release, charge, refund; reply types: success, failure, timeout)
+   - correlation ID for matching replies to requests
+   - thread-local publisher connections (as attempt 1 correctly did — avoid sharing connections across threads)
+4. Implement participant RabbitMQ consumers in stock and payment:
+   - consume from `stock.commands` / `payment.commands`
+   - dispatch to Lua-based atomic operations
+   - publish results to `coordinator.replies`
+   - all operations idempotent by `tx_id`
+5. Implement the canonical checkout transaction summary record and coordinator metadata keys:
+   - `order_active_tx:{order_id}` (with TTL)
+   - `tx:{tx_id}`
+   - `tx_decision:{tx_id}`
+   - `order_commit_fence:{order_id}`
+6. Separate domain persistence from orchestration persistence at the code level.
+7. Add `STOCK_SERVICE_URL` and `PAYMENT_SERVICE_URL` for non-transactional HTTP lookups; update `addItem` to use direct stock URL.
+8. Increase gunicorn workers: `-w 8` for order, `-w 4` for stock and payment.
+9. Add `GET /internal/tx_decision/{tx_id}` to the order service for participant startup reconciliation queries.
+10. Create the coordinator package skeleton with result types and protocol interface. Verify it has no Flask imports.
+11. Set up the `CHECKOUT_PROTOCOL` environment variable with fail-fast validation.
+
+Key design choices from attempt 1 to preserve:
+
+- Thread-local publisher connections (avoids pika channel-sharing bugs under concurrent requests)
+- Persistent messages with delivery_mode=2
+- Inbox/effect markers for idempotency within Lua scripts (attempt 1's Lua scripts already did this correctly)
+- DLQ for poison messages
+
+Key design choices from attempt 1 to avoid:
+
+- No Redis polling loop for checkout response — coordinator blocks on reply queue instead
+- No separate worker process for orchestration — coordinator is in-process
+- No complex retry-queue topology (main → retry → main loop) — keep it simple: DLQ + recovery worker re-publish
+- No 7-day idempotency marker TTL — use TTL appropriate for the recovery window (e.g., 1 hour)
 
 Validation:
 
-1. Review the public API surface against `assignment.md`.
-2. Add or update tests that assert the existing route shapes and already-paid `200` behavior still match the contract.
-3. Add a configuration test that invalid protocol values fail fast.
+1. Write unit tests proving Lua-based subtract/add are atomic under concurrent access.
+2. Write idempotency tests for repeated `tx_id` participant operations (via RabbitMQ consumer).
+3. Write serialization/deserialization tests for transaction records.
+4. Write a configuration test that invalid protocol values fail fast.
+5. Verify existing public API tests still pass.
+6. Verify RabbitMQ queues are created and messages flow end-to-end (publish command → consume → process → publish reply → consume reply).
 
 Acceptance criteria:
 
-1. Public API behavior remains unchanged from the client perspective.
-2. The coordinator can be imported without Flask dependencies.
-3. Protocol mode is clearly defined as deployment-wide and cannot silently drift per service.
+1. No read-modify-write race condition exists in any participant operation.
+2. Participant RabbitMQ consumers are idempotent and use durable holds for 2PC prepare.
+3. Messages flow correctly through RabbitMQ queues.
+4. Non-transactional HTTP calls bypass the gateway.
+5. Worker counts are sufficient for concurrent load.
+6. Coordinator package is importable without Flask.
 
-### Step 2: Build the durable data model and atomic state-transition substrate
+### Step 2: Coordinator and protocols — SAGA and 2PC with parallel RabbitMQ fan-out
 
 What should happen:
 
-1. Implement the order domain model.
-2. Implement the canonical checkout transaction summary record.
-3. Implement the append-only per-transaction step log.
-4. Implement coordinator metadata keys:
-   - active tx guard
-   - commit fence
-   - request lease lock
-5. Separate domain persistence from orchestration persistence.
-6. Implement atomic write helpers so one logical transition updates summary and log together.
+1. Implement `CoordinatorService.execute_checkout(order_id, order_snapshot, mode)`:
+   - publishes commands to stock and payment queues in parallel
+   - blocks on coordinator reply queue with bounded timeout for both participant results
+   - makes commit/abort decision based on results
+   - publishes commit/abort commands in parallel
+   - blocks on confirmations
+2. Implement `CoordinatorService.resume_transaction(tx_id)` for recovery.
+3. Implement the SAGA protocol:
+   - publish reserve-stock + charge-payment **in parallel** → wait for both replies
+   - if both succeed → mark paid → complete
+   - if either fails → publish compensation for the other **in parallel** → mark aborted
+   - forward recovery after successful charge (complete forward, don't reverse)
+4. Implement the 2PC protocol:
+   - publish prepare-stock + prepare-payment **in parallel** → wait for both replies
+   - if both prepared → persist commit decision → set fence → publish commit-stock + commit-payment **in parallel** → wait for confirmations → mark paid → clear fence → complete
+   - if either prepare fails/times out → persist abort decision → publish abort **in parallel** → mark aborted
+   - presumed abort when no durable commit decision exists
+5. Implement the already-paid fast path:
+   - if `paid == true` and no active tx and no commit fence → return `200` immediately
+   - no tx record created, no RabbitMQ interaction, no side effects
+6. Wire the checkout route as a thin adapter:
+   - validate order exists
+   - check fast path
+   - acquire active-tx guard (`SET NX EX`)
+   - if acquisition fails: check if existing tx is terminal. If non-terminal → `409`. If terminal/expired → clean up and retry acquisition.
+   - call coordinator
+   - map structured result to HTTP
+   - clear guard on terminal state
+
+Critical `FAILED_NEEDS_RECOVERY` handling (from attempt 2 bug):
+
+- `FAILED_NEEDS_RECOVERY` is **NOT** a terminal status for the purpose of clearing the active-tx guard.
+- The guard must remain in place until recovery moves the transaction to `COMPLETED` or `ABORTED`.
+- If a new checkout request arrives and finds an active-tx guard pointing to a `FAILED_NEEDS_RECOVERY` transaction, it returns `409`. The recovery worker will handle it.
+
+Timeout handling for RabbitMQ replies:
+
+- If a participant reply does not arrive within the deadline (e.g., 5 seconds), the coordinator treats it as a failure.
+- For SAGA: compensate the other participant if it succeeded.
+- For 2PC: abort (no commit decision has been written yet, so presumed abort is safe).
+- The transaction is marked `FAILED_NEEDS_RECOVERY` if compensation/abort also fails.
+- The recovery worker will re-publish commands later. Participants are idempotent, so re-delivery is safe.
 
 Validation:
 
-1. Write unit tests for serialization/deserialization of all transaction records.
-2. Write store-level tests that prove a transition cannot leave summary and log out of sync.
-3. Write crash-window tests for ambiguous transitions:
-   - before append
-   - after append
-   - after atomic transition write
+1. Write protocol-unit tests (no Flask) for:
+   - SAGA happy path (parallel reserve+charge), stock rejection, payment rejection, both reject
+   - 2PC happy path (parallel prepare), prepare rejection, timeout, crash after commit decision
+   - duplicate compensation/commit replay
+   - SAGA partial success (stock OK, payment fail → compensate stock; payment OK, stock fail → compensate payment)
+2. Write integration tests exercising the checkout route in both modes.
+3. Write tests proving already-paid returns `200` with no side effects.
+4. Write tests proving concurrent checkout on the same order produces at most one outcome.
+5. Write tests proving `FAILED_NEEDS_RECOVERY` does not clear the active-tx guard.
 
 Acceptance criteria:
 
-1. A transaction can be reconstructed from durable Redis state alone.
-2. Domain records and orchestration records are not conflated in one opaque persistence layer.
-3. Summary/log divergence for the same transition is prevented by construction.
-4. The storage layer reflects the clean-slate schema assumption and does not carry compatibility shims for older layouts.
+1. Both protocols produce correct outcomes on the happy path and all failure paths.
+2. Stock and payment operations execute in parallel (not serial).
+3. No stock or payment drift on any failure, including partial success in parallel execution.
+4. The route is thin and protocol-agnostic.
+5. The already-paid path is cheap, side-effect free, and involves no RabbitMQ interaction.
+6. `FAILED_NEEDS_RECOVERY` never clears the active-tx guard.
 
-### Step 3: Build participant transaction primitives first
-
-What should happen:
-
-1. Implement payment internal handlers for:
-   - saga pay
-   - saga refund
-   - 2PC prepare
-   - 2PC commit
-   - 2PC abort
-2. Implement stock internal handlers for:
-   - saga reserve
-   - saga release
-   - 2PC prepare
-   - 2PC commit
-   - 2PC abort
-3. Represent 2PC prepare as durable holds, not transient locks.
-4. Add participant-side startup reconciliation.
-5. Add bounded stale-hold cleanup.
-6. Shape the stock interface so batched work over aggregated item snapshots is possible.
-
-Validation:
-
-1. Write idempotency tests for repeated `tx_id` requests.
-2. Write participant restart tests proving prepared state survives process restart.
-3. Write tests for stale-hold cleanup that prove cleanup never violates a durable coordinator decision.
-4. Write tests for batched stock operations if batching is implemented.
-
-Acceptance criteria:
-
-1. Repeating the same internal participant request is safe.
-2. Prepared stock and funds remain protected until `commit` or `abort`.
-3. Participant behavior is modular and shared across protocol callers instead of duplicated.
-4. Abandoned prepared holds do not remain stuck indefinitely after recoverable failures.
-
-### Step 4: Implement the pure coordinator service
-
-What should happen:
-
-1. Implement `CoordinatorService.execute_checkout(...)`.
-2. Implement `CoordinatorService.resume_transaction(...)`.
-3. Keep all Flask response construction outside the coordinator.
-4. Route all protocol selection through a single coordinator-owned dispatch path.
-
-Validation:
-
-1. Write unit tests for coordinator state transitions without importing Flask.
-2. Write tests that assert routes only map structured results to HTTP responses.
-3. Inspect the code for duplicate orchestration logic outside the coordinator boundary.
-
-Acceptance criteria:
-
-1. Coordinator logic is unit-testable in isolation.
-2. Route handlers are thin adapters.
-3. Protocol selection and recovery entry are centralized in one reusable service surface.
-
-### Step 5: Implement the optimized already-paid fast path
-
-What should happen:
-
-1. Add the lightweight pre-check for:
-   - `paid`
-   - active tx guard
-   - commit fence
-2. Return immediate `200` when the order is safely paid.
-3. Avoid creating a new transaction record for this no-op path.
-4. Avoid entering full coordination for this path.
-
-Validation:
-
-1. Write route tests proving already-paid checkout returns `200`.
-2. Write tests proving the fast path does not:
-   - create a tx
-   - mutate stock
-   - mutate payment
-   - append a tx log event
-3. Benchmark the fast path separately from real checkout work.
-
-Acceptance criteria:
-
-1. The already-paid path is correct and side-effect free.
-2. The already-paid path is cheaper than the real checkout path by design.
-3. The optimization does not bypass ambiguity checks such as active tx or commit-fence state.
-
-### Step 6: Implement the SAGA protocol on the new substrate
-
-What should happen:
-
-1. Implement SAGA against the coordinator ports, not route code.
-2. Use aggregated item snapshots, not raw order lines.
-3. Persist each meaningful transition through the shared atomic transition helpers.
-4. Implement reverse-order compensation using durable step state.
-
-Validation:
-
-1. Write protocol-unit tests for:
-   - happy path
-   - stock rejection
-   - payment rejection
-   - duplicate compensation replay
-2. Write integration tests proving no stock/payment drift on failure.
-3. Write crash-recovery tests for interrupted compensation.
-
-Acceptance criteria:
-
-1. Stock failure leaves no payment or stock drift.
-2. Payment failure leaves no stock drift.
-3. SAGA logic does not duplicate coordinator or route behavior.
-4. Compensation is safe to replay.
-
-### Step 7: Implement the 2PC protocol on the new substrate
-
-What should happen:
-
-1. Implement the prepare phase for stock and payment.
-2. Persist the global commit decision before any commit call.
-3. Implement commit-fence behavior for post-decision crashes.
-4. Implement abort handling for all prepared branches.
-5. Keep commit-fence resolution in one shared coordinator-owned path.
-
-Validation:
-
-1. Write protocol-unit tests for:
-   - all-yes prepare
-   - stock prepare rejection
-   - payment prepare rejection
-   - crash after durable commit decision
-   - repeated commit/abort requests
-2. Write recovery tests for presumed-abort behavior when no durable commit decision exists.
-3. Write tests that prove no participant can commit before the durable decision is written.
-
-Acceptance criteria:
-
-1. No participant commits before a durable global commit decision exists.
-2. In-doubt branches can be resolved through durable state and presumed abort.
-3. Commit-fence logic exists in one place only.
-4. 2PC participant semantics remain explicit and recoverable.
-
-### Step 8: Implement the recovery worker and replica-safe recovery control
+### Step 3: Recovery worker
 
 What should happen:
 
 1. Implement startup scanning for non-terminal transactions.
 2. Implement periodic recovery scanning.
 3. Use `CoordinatorService.resume_transaction(...)` for all repair work.
-4. Add a distributed leader lock so only one `order` replica runs the scanner at a time.
+4. Recovery re-publishes commands to RabbitMQ (the same queues as normal checkout). Participants are idempotent by tx_id, so re-delivery is safe.
+5. Recovery for SAGA:
+   - stock reserved + payment charged → complete forward (mark paid)
+   - stock reserved + payment not charged → publish release to stock
+   - payment charged + stock not reserved → publish refund to payment
+   - neither succeeded → mark aborted (nothing to compensate)
+6. Recovery for 2PC:
+   - commit decision exists → re-publish commit commands to all participants
+   - no commit decision → presumed abort → publish abort commands to all participants
+   - commit fence exists but order not paid → complete forward
+7. Recovery issues explicit abort/release commands for stale prepared holds.
 
 Validation:
 
 1. Write tests for duplicate recovery invocation; replay must be idempotent.
-2. Write tests for multi-replica leader-lock behavior.
-3. Write service-restart tests for both SAGA and 2PC interrupted flows.
+2. Write service-restart tests for both SAGA and 2PC interrupted flows.
+3. Write tests proving recovery converges crashed transactions to terminal states.
+4. Write tests proving recovery does not race with active request-path coordination (active-tx guard prevents overlap).
 
 Acceptance criteria:
 
-1. A service restart can converge interrupted transactions.
-2. Recovery remains single-active when `order` is horizontally scaled.
-3. Recovery logic is not duplicated across route code, protocol code, and worker code.
+1. A service restart converges all interrupted transactions.
+2. Recovery logic is not duplicated — it goes through the coordinator, which re-publishes to the same RabbitMQ queues.
+3. Stale prepared holds are cleaned up by the coordinator, not unilaterally by participants.
 
-### Step 9: Replace legacy checkout internals with the new orchestration path
-
-What should happen:
-
-1. Keep the route path unchanged.
-2. Replace legacy inline rollback logic with coordinator invocation.
-3. Keep the route as:
-   - validation
-   - fast-path pre-check
-   - lock acquisition
-   - coordinator call
-   - HTTP mapping
-4. Remove any duplicated orchestration logic left in old route code.
-
-Validation:
-
-1. Write integration tests that exercise the route in both `saga` and `2pc` modes.
-2. Review the final route code for architecture violations:
-   - no protocol logic
-   - no duplicated recovery logic
-   - no direct participant choreography
-
-Acceptance criteria:
-
-1. The route is thin and protocol-agnostic.
-2. Both modes run through the same coordinator entrypoint.
-3. The final route implementation is simpler than the legacy path, not just relocated complexity.
-
-### Step 10: Research, implement, and run the full validation matrix
+### Step 4: End-to-end validation and benchmark tuning
 
 What should happen:
 
-1. Research the full set of tests required for this architecture, not just the ones already listed in the repo.
-2. Implement the missing tests needed to validate:
-   - domain correctness
-   - participant idempotency
-   - coordinator transitions
-   - recovery
-   - concurrency
-   - throughput interpretation
-3. Run the suite in `saga` mode.
-4. Restart the stack and run the suite in `2pc` mode.
-5. Run benchmark-visible stress scenarios separately for:
-   - reused-order checkout throughput
-   - create-order end-to-end throughput
-6. Run the consistency benchmark as an invariant check.
-
-Validation:
-
-1. Review the repository and benchmark repo to discover missing scenarios, especially around:
-   - duplicate checkouts
-   - already-paid no-op handling
+1. Run the full test suite in `saga` mode, then `2pc` mode.
+2. Run the provided benchmark (`wdm-project-benchmark`):
+   - consistency test as an invariant checker
+   - reused-order stress test for headline throughput
+   - create-order stress test for committed checkout throughput
+3. Identify and fix any consistency failures or performance bottlenecks.
+4. Add tests for any discovered gaps, especially:
+   - large-order behavior with aggregated items
+   - concurrent duplicate checkouts
    - commit-fence recovery
-   - multi-replica recovery worker behavior
-   - large-order behavior under aggregated item snapshots
-2. Add tests for every discovered gap before calling the plan complete.
-3. Capture measured latency and throughput separately for:
-   - headline request throughput
-   - committed checkout throughput
+5. Tune worker counts and connection pooling based on benchmark results.
 
 Acceptance criteria:
 
-1. Baseline behavior passes in both modes.
-2. Failure, retry, and recovery paths preserve invariants.
-3. Test coverage explicitly validates the consistency guarantees claimed by the design.
-4. Performance reports distinguish no-op `200` throughput from actual committed checkout throughput.
+1. Consistency test passes with zero stock/payment drift in both modes.
+2. Performance is reasonable for the synchronous architecture (specific numbers depend on hardware).
+3. Both throughput metrics (headline and committed) are measured and reported separately.
+
+### Step 5: Container fault tolerance
+
+What should happen:
+
+1. Test single-container failure scenarios:
+   - kill order service during checkout → recovery converges after restart
+   - kill stock service during checkout → coordinator detects failure, aborts or retries
+   - kill payment service during checkout → same
+   - kill a Redis instance → service reconnects, recovery picks up
+2. Fix any issues discovered during fault injection.
+3. Verify the system remains consistent after each failure scenario.
+
+Validation:
+
+1. Script the failure scenarios (docker kill + docker start).
+2. Run consistency checks after each recovery.
+
+Acceptance criteria:
+
+1. Single-container failure does not cause permanent inconsistency.
+2. The system recovers to a consistent state within a bounded time after the failed container restarts.
 
 ## Testing Priorities
 
 The following scenarios must be covered before considering the rebuild stable.
 
-1. Happy-path checkout succeeds in `saga`.
-2. Happy-path checkout succeeds in `2pc`.
-3. Out-of-stock aborts cleanly in both modes.
-4. Insufficient credit aborts cleanly in both modes.
-5. Duplicate checkout of an already-paid order returns `200` with no extra side effects.
-6. Concurrent checkout requests for the same order do not double-apply side effects.
-7. Crash after 2PC commit decision but before order finalization recovers to a consistent result.
-8. Crash during saga compensation resumes safely.
-9. Replayed internal participant requests are idempotent.
-10. Recovery worker remains single-active under multiple `order` replicas.
-11. The already-paid fast path returns `200` without entering full transaction coordination.
+1. **Participant atomicity**: concurrent subtract/add calls on the same item/user produce correct totals (Lua script correctness).
+2. Happy-path checkout succeeds in `saga` (parallel reserve + charge).
+3. Happy-path checkout succeeds in `2pc` (parallel prepare → decision → parallel commit).
+4. Out-of-stock aborts cleanly in both modes (including compensating the payment participant that succeeded in parallel).
+5. Insufficient credit aborts cleanly in both modes (including compensating the stock participant that succeeded in parallel).
+6. Duplicate checkout of an already-paid order returns `200` with no extra side effects and no RabbitMQ interaction.
+7. Concurrent checkout requests for the same order do not double-apply side effects.
+8. Crash after 2PC commit decision but before order finalization recovers to a consistent result.
+9. Crash during SAGA after successful charge completes forward (marks paid, does not reverse).
+10. Crash during SAGA before charge compensates backward (releases stock).
+11. Replayed participant commands via RabbitMQ are idempotent.
+12. The already-paid fast path returns `200` without entering full transaction coordination.
+13. Single-container failure (order, stock, payment, Redis, or RabbitMQ) followed by restart converges to consistent state.
+14. `FAILED_NEEDS_RECOVERY` does not clear the active-tx guard (attempt 2 bug — must not recur).
+15. RabbitMQ reply timeout triggers correct compensation/abort behavior.
+16. Participant timeout (one participant replies, other times out) triggers correct partial-failure handling in both modes.
 
 ## Benchmark Notes
 
@@ -1375,13 +1581,14 @@ Operational takeaway:
 
 This section collects the main ideas we explicitly decided not to use in Phase 1.
 
-### No message bus on the checkout path
+### No serial HTTP-only checkout path (REVERSED)
 
-Rejected for Phase 1 because:
+Previously rejected message bus on the checkout path. Now reversed: RabbitMQ is used for internal coordinator↔participant transport with parallel fan-out. See the "Use RabbitMQ" decision record above for full rationale.
 
-1. It increases tail latency on a synchronous API.
-2. It complicates 2PC more than it helps.
-3. It risks repeating attempt 1's scope drift.
+The key differences from the original rejection:
+1. We now use RabbitMQ for parallel fan-out, not as a polling-based orchestration layer.
+2. The coordinator still blocks synchronously on reply queues — no Redis polling loop like attempt 1.
+3. The assignment explicitly rewards event-driven architecture, and the lecturer advises for it.
 
 ### No timestamp-ordering-first design
 
@@ -1397,7 +1604,7 @@ Rejected for Phase 1 because:
 
 1. It is architecturally larger than needed.
 2. It complicates reads and debugging of business-state queries.
-3. A hybrid summary + per-tx log captures the valuable parts with much less cost.
+3. A hybrid summary record + durable decision marker + application logs captures the valuable parts with much less cost.
 
 ### No "heal everything inline" request path
 
@@ -1428,6 +1635,12 @@ This rebuild is ready for Phase 1 delivery when all of the following are true:
 7. Performance measurements explicitly separate no-op request throughput from committed checkout throughput.
 8. Critical logic remains modular, with no duplicated recovery/protocol paths.
 9. Non-obvious correctness-critical code paths are commented clearly enough to explain why they are safe.
+10. All participant read-modify-write operations are atomic (Lua scripts).
+11. Internal transaction operations use RabbitMQ. Non-transactional lookups use direct HTTP. Nothing routes through nginx internally.
+12. Gunicorn worker counts are tuned for the architecture.
+13. Single-container failure followed by restart converges to a consistent state.
+14. Stock and payment operations execute in parallel via RabbitMQ fan-out.
+15. The architecture qualifies as event-driven for the assignment's difficulty scoring.
 
 ## Phase 2 Extraction Path
 
@@ -1435,9 +1648,12 @@ The rebuild is intentionally shaped so Phase 2 becomes a relocation exercise, no
 
 Expected Phase 2 move:
 
-1. Move `coordinator/` into its own service.
-2. Replace direct in-process coordinator calls with network calls from `order`.
+1. Move `coordinator/` into its own service. It already communicates with participants via RabbitMQ, so the transport layer does not change.
+2. Replace the in-process coordinator call from the `order` checkout route with a network call (HTTP or RabbitMQ) to the orchestrator service.
 3. Keep protocol logic, state transitions, and recovery model largely unchanged.
-4. Keep participant internal APIs as the contract between coordinator and services.
+4. Move the recovery worker with the coordinator into the orchestrator service.
+5. Keep participant RabbitMQ consumers unchanged — they already talk to the coordinator through message queues, not in-process calls.
+
+The RabbitMQ-based architecture makes Phase 2 extraction simpler than the direct-HTTP alternative, because participants already communicate through queues rather than being coupled to the order service's internal URL.
 
 If Phase 1 code cannot be moved this way, the boundary is still too coupled and should be corrected before deeper implementation continues.

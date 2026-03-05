@@ -62,16 +62,20 @@ Target Phase 2 runtime:
    - owns protocol execution
    - owns transaction state machine
    - owns transaction recovery
+   - publishes commands to participant RabbitMQ queues (same queues as Phase 1)
+   - consumes replies from coordinator reply queue
 2. `order` service:
    - remains the public order API
    - manages order-domain state only
-   - delegates checkout orchestration to the orchestrator
+   - delegates checkout orchestration to the orchestrator (via HTTP or RabbitMQ call)
 3. `payment` service:
    - remains the payment-domain API
-   - exposes participant transaction operations to the orchestrator
+   - RabbitMQ consumer for transaction commands (unchanged from Phase 1)
 4. `stock` service:
    - remains the stock-domain API
-   - exposes participant transaction operations to the orchestrator
+   - RabbitMQ consumer for transaction commands (unchanged from Phase 1)
+
+The RabbitMQ-based architecture makes Phase 2 extraction simpler: participants already communicate through message queues, not in-process calls to the order service. Moving the coordinator into a separate service only changes who publishes to those queues.
 
 ## Responsibility Split
 
@@ -80,7 +84,7 @@ Target Phase 2 runtime:
 1. protocol selection
 2. transaction creation
 3. transaction status transitions
-4. durable transaction summary and step log
+4. durable transaction summary and decision markers
 5. commit-fence handling
 6. recovery and resume logic
 7. participant coordination
@@ -170,6 +174,10 @@ That includes:
 3. recovery-required meaning
 4. participant prepared/committed/aborted semantics
 
+### 5. Internal Decision Query API
+
+The `GET /internal/tx_decision/{tx_id}` endpoint on the order service (or orchestrator in Phase 2) must remain stable. Participants use this for startup reconciliation of non-terminal local tx records.
+
 ## Data Ownership After Extraction
 
 ### Phase 1
@@ -258,7 +266,10 @@ These assumptions are intentionally temporary and should be revisited in Phase 2
 
 1. The coordinator runs in the same deployable as `order`.
 2. The `order` service physically stores coordinator transaction state.
-3. Internal orchestrator calls are local in-process calls.
+3. The checkout route calls the coordinator in-process. In Phase 2, this becomes a network call.
+4. Participant communication already uses RabbitMQ — this does NOT change in Phase 2.
+5. Recovery runs as a single instance (no distributed leader lock). Scaling requires adding leader election.
+6. Intermediate protocol steps are observed via application logs, not durable per-tx Redis logs. Phase 2 may introduce structured event storage if needed.
 
 These are acceptable only because the code boundary is already separated.
 

@@ -405,7 +405,7 @@ Implementation:
 - add `STOCK_SERVICE_URL` and `PAYMENT_SERVICE_URL` to docker-compose environment for the order service (for non-transactional HTTP lookups)
 - add `ORDER_SERVICE_URL` to docker-compose environment for stock and payment services (for `GET /internal/tx_decision/{tx_id}` queries during startup reconciliation)
 - add `RABBITMQ_URL` to all services for message broker connectivity
-- keep `GATEWAY_URL` only if any path genuinely requires external gateway routing
+- remove `GATEWAY_URL` entirely — no internal path needs it (see "Eliminate GATEWAY_URL" section below)
 
 ### Decision: Gunicorn worker count must match the synchronous blocking architecture
 
@@ -732,12 +732,42 @@ Phase 1 runtime shape:
 
 Message topology:
 
-- `stock.commands` queue (durable) — coordinator publishes stock prepare/commit/abort/reserve/release
-- `payment.commands` queue (durable) — coordinator publishes payment prepare/commit/abort/charge/refund
-- `coordinator.replies` queue (durable) — participants publish results back to coordinator
+- `stock.commands` queue (durable) — coordinator publishes stock hold/release/commit commands
+- `payment.commands` queue (durable) — coordinator publishes payment hold/release/commit commands
+- per-process reply queues (exclusive, auto-delete) — each gunicorn worker process creates its own reply queue on startup (e.g., `coordinator.replies.{uuid}`). Participants reply to the queue name specified in the message's `reply_to` field. This ensures replies always reach the correct process.
 - `*.dlq` queues — dead-letter queues for unprocessable messages
 - all messages are persistent (delivery_mode=2)
-- all messages carry `tx_id` and `correlation_id` for routing and idempotency
+- all messages carry `tx_id`, `correlation_id`, and `reply_to` fields
+
+Reply correlation pattern:
+
+1. Each gunicorn worker process starts a background consumer thread on startup.
+2. The background thread consumes from the process's exclusive reply queue.
+3. Request-handler threads register a `threading.Event` in a shared correlation map keyed by `tx_id` before publishing commands.
+4. When the background thread receives a reply, it stores the result in the correlation map and signals the event.
+5. The request-handler thread waits on the event with a bounded timeout.
+6. On timeout, the request-handler treats the missing reply as a participant failure.
+
+Gunicorn prefork lifecycle constraint:
+
+1. Gunicorn uses a prefork model: the master process forks worker processes. If RabbitMQ connections are opened before forking, child processes inherit stale file descriptors that will fail silently or raise exceptions.
+2. All RabbitMQ connections (publisher, reply consumer) must be created inside each worker process after forking — use gunicorn's `post_fork` or `post_worker_init` hook, never at module import time.
+3. If a worker dies and is respawned (crash, `max_requests` recycling), its exclusive reply queue is auto-deleted and any in-flight replies to that queue are lost. This is acceptable: the coordinator thread's `Event.wait()` times out, the transaction is marked `FAILED_NEEDS_RECOVERY`, and the recovery worker picks it up on the next scan.
+
+Why per-process reply queues (not a shared `coordinator.replies` queue):
+
+1. With a shared queue and 8 worker processes, any process could consume any reply. A reply intended for process A could be consumed by process B, which has no matching correlation entry.
+2. Per-process exclusive queues guarantee that replies always arrive at the process that published the command.
+3. Exclusive queues are auto-deleted when the process disconnects, so they don't accumulate.
+4. This is the standard RabbitMQ RPC pattern adapted for multi-process servers.
+
+Pika threading constraints:
+
+1. Pika's `BlockingConnection` is not thread-safe. Each thread that interacts with RabbitMQ needs its own connection.
+2. Publisher connections: use `threading.local()` for per-thread publisher connections (as attempt 1 correctly did).
+3. Reply consumer: one dedicated background thread per process with its own connection, consuming from the process's exclusive reply queue.
+4. The correlation map (dict + events) is the only shared state between the publisher threads and the consumer thread. Use a `threading.Lock` to protect it.
+5. Participant consumers in stock/payment services: one consumer thread per process with its own connection.
 
 Code boundaries:
 
@@ -775,9 +805,11 @@ Target structure for the rebuild:
 
 ```text
 common/
+  __init__.py
   messaging.py        # RabbitMQ connection, publish, consume helpers
   result.py           # Structured result types
-  models.py           # Shared message contracts (command types, reply types)
+  models.py           # msgspec Struct definitions for all RabbitMQ messages (commands + replies)
+  constants.py        # Shared enums/constants: command names, status codes, error codes
 
 coordinator/
   models.py           # CheckoutTxValue, status constants
@@ -819,6 +851,7 @@ stock/
 
 The important constraints are architectural, not naming:
 
+- `common/` is a shared package imported by all three services and the coordinator. It contains message definitions (`msgspec.Struct` types), RabbitMQ helpers, and shared constants. It must not depend on Flask, Redis, or any service-specific code.
 - `coordinator/` must not depend on Flask
 - `coordinator/` must depend on interfaces/ports, not concrete route modules
 - participant workers consume from RabbitMQ and call Lua scripts — they do not import Flask
@@ -842,22 +875,92 @@ One durable coordinator record per checkout transaction:
 
 - `tx_id`
 - `order_id`
+- `user_id` (copied from order at tx creation — needed for payment commands)
+- `total_cost` (computed from aggregated items — needed for payment commands)
 - `protocol` (`saga` or `2pc`)
-- `status`
+- `status` (see status constants below)
 - `decision` (`commit` or `abort`, only when relevant)
-- `items_snapshot` (aggregated, deterministic item list)
-- `stock_prepared`
-- `stock_committed`
-- `stock_compensated`
-- `payment_prepared`
-- `payment_committed`
-- `payment_reversed`
-- `last_error`
-- `created_at`
-- `updated_at`
-- `retry_count`
+- `items_snapshot` (aggregated, deterministic item list: `list[tuple[item_id, quantity]]`)
+- `stock_held` (bool — stock hold/prepare succeeded)
+- `stock_committed` (bool — stock commit succeeded, 2PC only)
+- `stock_released` (bool — stock release/abort/compensate succeeded)
+- `payment_held` (bool — payment hold/prepare succeeded)
+- `payment_committed` (bool — payment commit succeeded, 2PC only)
+- `payment_released` (bool — payment release/abort/compensate succeeded)
+- `last_error` (string, optional)
+- `created_at` (epoch ms)
+- `updated_at` (epoch ms)
+- `retry_count` (int)
 
 This record is the fast-path materialized view used by the coordinator during normal execution.
+
+### Status Constants and State Machine
+
+Terminal statuses (safe to clear active-tx guard):
+
+- `COMPLETED` — checkout fully committed, order marked paid
+- `ABORTED` — checkout cleanly aborted, all side effects reversed
+
+Non-terminal statuses (**must NOT clear active-tx guard**):
+
+- `INIT` — tx record created, no participant commands sent yet
+- `HOLDING` — hold commands published to participants, waiting for replies
+- `HELD` — all holds succeeded, ready for decision (2PC) or finalization (SAGA)
+- `COMMITTING` — commit decision persisted, commit commands published (2PC only)
+- `COMPENSATING` — compensation/abort commands published, waiting for replies
+- `FAILED_NEEDS_RECOVERY` — an operation failed and recovery must resolve it
+
+**Critical invariant**: `FAILED_NEEDS_RECOVERY` is NOT terminal. It must NOT clear the active-tx guard. This was the root cause of the duplicate-checkout bug in attempt 2.
+
+**Critical invariant**: participant progress flags (`stock_held`, `payment_held`, etc.) must be updated in the tx record as each reply arrives during `HOLDING`, not deferred until the state transition. If the coordinator crashes mid-HOLDING after receiving one reply, recovery must be able to see which participant succeeded so it can compensate correctly. Without incremental flag updates, recovery sees `HOLDING` with all flags false and cannot distinguish "neither replied" from "one replied but the flag wasn't persisted."
+
+#### SAGA state transitions
+
+```
+INIT → HOLDING (hold commands published to stock + payment)
+HOLDING → HELD (both holds succeeded)
+HOLDING → COMPENSATING (one or both holds failed/timed out; compensate all that may have succeeded)
+HELD → COMMITTING (order marked paid, commit commands published to finalize participant tx records)
+COMMITTING → COMPLETED (both commits confirmed)
+COMMITTING → FAILED_NEEDS_RECOVERY (commit confirmation failed — order is already paid, just need to retry commits)
+HELD → COMPENSATING (order mark-paid failed)
+COMPENSATING → ABORTED (all compensations succeeded or returned tx_not_found)
+COMPENSATING → FAILED_NEEDS_RECOVERY (compensation failed)
+FAILED_NEEDS_RECOVERY → COMPENSATING (recovery retries compensation)
+FAILED_NEEDS_RECOVERY → COMMITTING (recovery finds order already paid → re-publish commits)
+FAILED_NEEDS_RECOVERY → COMPLETED (recovery discovers commits already confirmed)
+```
+
+**Stale `HOLDING` recovery**: if the coordinator crashes mid-`HOLDING` (e.g., one participant reply received and its flag persisted, but the process dies before the second reply or status transition), the tx stays in `HOLDING` with partially-updated flags. The recovery worker treats stale `HOLDING` the same as `FAILED_NEEDS_RECOVERY`: it inspects the participant flags to determine which holds succeeded, then compensates or completes forward accordingly. There is no explicit `HOLDING → FAILED_NEEDS_RECOVERY` transition needed — recovery operates directly on the stale `HOLDING` record. The active-tx guard's TTL ensures the guard eventually expires so recovery can acquire it.
+
+SAGA recovery direction:
+- `HELD` with both holds succeeded → complete forward (mark paid, send commits). Note: if the coordinator crashes after marking the order paid but before transitioning to `COMMITTING`, recovery still sees `HELD`. This is safe because `mark paid` is idempotent (a second write is a no-op on an already-paid order). Recovery re-marks paid, publishes commit commands, and transitions to `COMPLETED`.
+- `HOLDING` with one hold succeeded, one failed/unknown → compensate all that may have succeeded (including timed-out participants)
+- `COMMITTING` → re-publish commit commands (order is already paid, just finalizing participant records)
+- `COMPENSATING` → retry compensation
+
+#### 2PC state transitions
+
+```
+INIT → HOLDING (prepare commands published to stock + payment)
+HOLDING → HELD (both prepares succeeded — "all voted yes")
+HOLDING → COMPENSATING (one or both prepares failed/timed out; abort ALL participants including timed-out ones)
+HELD → COMMITTING (commit decision persisted + fence set + commit commands published — see write ordering below)
+COMMITTING → COMPLETED (all commits confirmed + order marked paid + fence cleared)
+COMMITTING → FAILED_NEEDS_RECOVERY (commit confirmation failed)
+COMPENSATING → ABORTED (all aborts succeeded or returned tx_not_found)
+COMPENSATING → FAILED_NEEDS_RECOVERY (abort failed)
+FAILED_NEEDS_RECOVERY → COMMITTING (recovery finds commit decision → re-publish commits)
+FAILED_NEEDS_RECOVERY → COMPENSATING (recovery finds no commit decision → presumed abort)
+FAILED_NEEDS_RECOVERY → COMPLETED (recovery discovers order already paid)
+```
+
+**Stale `HOLDING` recovery (2PC)**: same principle as SAGA. If the coordinator crashes mid-`HOLDING`, recovery inspects the partially-updated participant flags. Since no commit decision can exist yet (decisions are only written after `HELD`), recovery applies presumed abort: it publishes abort commands to all participants that may have prepared. Participants are idempotent — aborting a non-existent prepare returns `tx_not_found` harmlessly.
+
+2PC recovery direction:
+- `tx_decision:{tx_id}` exists with value `commit` → re-publish commit commands
+- `order_commit_fence:{order_id}` exists → re-publish commit commands
+- neither exists → presumed abort → publish abort commands
 
 ### Structured Application Logging for Protocol Steps
 
@@ -905,24 +1008,129 @@ Each participant stores per-transaction state by `tx_id`:
 
 Participant operations must be idempotent by `tx_id`.
 
-### Participant Atomic Operations
+### Participant Operations: Unified Model for SAGA and 2PC
 
-All participant read-modify-write operations must be implemented as Lua scripts executed on the Redis server. This includes:
+SAGA and 2PC perform the same participant-side data operations — they differ only in the coordinator's control flow. The participant layer provides three operations per service that serve both protocols:
 
-- public endpoints: `/stock/subtract`, `/stock/add`, `/payment/pay`, `/payment/add_funds`
-- internal transaction endpoints: prepare, commit, abort for both 2PC and SAGA
+#### Stock operations
 
-Example Lua script pattern for stock subtract:
+| Operation | Stock effect | Tx record effect | Used by |
+|-----------|-------------|------------------|---------|
+| `hold` | check all items exist + sufficient stock → subtract all | create tx record per item (state from command) | SAGA reserve, 2PC prepare |
+| `release` | add back all items | mark all tx records released/aborted | SAGA compensate, 2PC abort |
+| `commit` | no stock change (already subtracted in hold) | mark all tx records committed | SAGA commit, 2PC commit |
+
+#### Payment operations
+
+| Operation | Credit effect | Tx record effect | Used by |
+|-----------|-------------|------------------|---------|
+| `hold` | check user exists + sufficient credit → subtract | create tx record (state from command) | SAGA charge, 2PC prepare |
+| `release` | add back credit | mark tx record refunded/aborted | SAGA compensate, 2PC abort |
+| `commit` | no credit change (already subtracted in hold) | mark tx record committed | SAGA commit, 2PC commit |
+
+The command message specifies which operation (`hold`, `release`, `commit`). Participants dispatch on command type. They do not need to know which protocol the coordinator is running — the command tells them what to do.
+
+**SAGA sends `commit` too**: after both holds succeed in SAGA, the coordinator sends `commit` commands to both participants (same as 2PC). This gives participant tx records a clean terminal state (`committed`) in both protocols. Without this, SAGA participant tx records would stay in `held` status indefinitely, making it impossible to distinguish "active hold waiting for decision" from "completed SAGA transaction" without querying the coordinator. The `commit` command for SAGA is a no-op on the data side (stock is already subtracted, credit already taken) — it only updates the participant tx record status.
+
+Public endpoints (`/stock/subtract`, `/stock/add`, `/payment/pay`, `/payment/add_funds`) use separate simpler Lua scripts with no tx record. These are independent of the transaction system.
+
+#### Batch stock Lua script (hold)
+
+The stock `hold` operation receives the full aggregated item list in one message and processes all items atomically in one Lua script invocation:
 
 ```lua
-local key = KEYS[1]
-local amount = tonumber(ARGV[1])
-local data = redis.call('GET', key)
-if not data then return redis.error_reply('not found') end
--- decode, check, modify, encode, set — all atomic
+-- KEYS[1..n] = item keys (e.g., "item:{item_id}" for each unique item)
+-- ARGV[1] = tx_id
+-- ARGV[2] = JSON-encoded array of {item_id, quantity} pairs
+-- ARGV[3..3+n-1] = quantities corresponding to each KEYS entry (for Redis cluster compat, though not needed in Phase 1)
+
+-- Idempotency check FIRST: if this tx_id was already processed, return
+-- the previous result immediately. This must precede validation because
+-- stock levels may have changed since the original call (consumed by
+-- other transactions), and re-validating would return a spurious
+-- insufficient_stock error on a legitimate replay.
+local existing_tx = redis.call('GET', 'stock_tx:' .. ARGV[1])
+if existing_tx then
+    return existing_tx  -- already processed, return previous result
+end
+
+-- First pass: validate all items exist and have sufficient stock
+for i = 1, #KEYS do
+    local data = redis.call('GET', KEYS[i])
+    if not data then
+        return cjson.encode({ok=false, error="not_found", item=KEYS[i]})
+    end
+    local item = cmsgpack.unpack(data)  -- or cjson.decode if using JSON
+    local qty = tonumber(ARGV[2 + i])
+    if item.stock < qty then
+        return cjson.encode({ok=false, error="insufficient_stock", item=KEYS[i]})
+    end
+end
+
+-- Second pass: subtract all items (only reached if all checks passed)
+for i = 1, #KEYS do
+    local data = redis.call('GET', KEYS[i])
+    local item = cmsgpack.unpack(data)
+    local qty = tonumber(ARGV[2 + i])
+    item.stock = item.stock - qty
+    redis.call('SET', KEYS[i], cmsgpack.pack(item))
+end
+
+-- Create tx record for idempotency and recovery
+local tx_record = {items=..., status="held", created_at=...}
+redis.call('SET', 'stock_tx:' .. ARGV[1], cjson.encode(tx_record))
+
+return cjson.encode({ok=true})
 ```
 
-The specific encoding/decoding depends on the serialization format (msgspec msgpack). The key requirement is that the read, check, modify, write cycle happens in a single atomic Redis operation with no window for concurrent interleaving.
+Key properties:
+
+1. **All-or-nothing**: if any item check fails, nothing is modified. No partial subtraction.
+2. **Idempotent**: if called again with the same `tx_id`, returns the previous result.
+3. **Atomic**: single Lua script execution, no interleaving with other Redis commands.
+4. **Multi-item**: all items in one invocation, not one network round trip per item.
+
+This works because each service has a single Redis instance (not a Redis Cluster). All item keys are on the same instance, so multi-key Lua is safe.
+
+The `release` and `commit` scripts follow the same pattern: look up the tx record by `tx_id`, modify the item data (for release) or just the tx record (for commit), and return.
+
+#### Payment Lua script (hold)
+
+Payment `hold` is simpler — one user, one amount:
+
+```lua
+-- KEYS[1] = user key
+-- ARGV[1] = tx_id
+-- ARGV[2] = amount
+
+-- Idempotency check
+local existing_tx = redis.call('GET', 'payment_tx:' .. ARGV[1])
+if existing_tx then return existing_tx end
+
+-- Check user exists and has sufficient credit
+local data = redis.call('GET', KEYS[1])
+if not data then return cjson.encode({ok=false, error="not_found"}) end
+local user = cmsgpack.unpack(data)
+local amount = tonumber(ARGV[2])
+if user.credit < amount then
+    return cjson.encode({ok=false, error="insufficient_credit"})
+end
+
+-- Subtract and persist
+user.credit = user.credit - amount
+redis.call('SET', KEYS[1], cmsgpack.pack(user))
+
+-- Create tx record
+redis.call('SET', 'payment_tx:' .. ARGV[1], cjson.encode({
+    user_id=KEYS[1], amount=amount, status="held"
+}))
+
+return cjson.encode({ok=true})
+```
+
+#### Serialization note for Lua scripts
+
+Redis Lua has built-in `cjson` and `cmsgpack` libraries. Since the existing codebase uses `msgspec` msgpack for Redis values, the Lua scripts should use `cmsgpack.unpack()` / `cmsgpack.pack()` to read/write the same format. If `cmsgpack` proves difficult to work with for complex structs, an alternative is to store item stock and price as separate Redis hash fields (`HGET`/`HSET`) instead of a single serialized blob — this avoids serialization inside Lua entirely. Either approach is acceptable; the key requirement is atomicity.
 
 ### Stale-Hold Cleanup
 
@@ -939,6 +1147,170 @@ If a participant needs to query the coordinator's decision (e.g., during startup
 - `GET /internal/tx_decision/{tx_id}` — returns `commit`, `abort`, or `unknown`
 
 Participants may use this during startup to reconcile non-terminal local tx records, but they must not unilaterally abort holds when the answer is `unknown`.
+
+### Message Contract
+
+All RabbitMQ messages use `msgspec` msgpack serialization — the same library already used for Redis values. This keeps a single serialization dependency across the entire codebase.
+
+Message definitions live in `common/models.py` as `msgspec.Struct` types. All three services and the coordinator import from this shared package. This is the single source of truth for the wire format.
+
+#### `common/models.py` — message definitions
+
+```python
+import msgspec
+from typing import Optional
+
+class StockHoldPayload(msgspec.Struct):
+    items: list[tuple[str, int]]  # [(item_id, quantity), ...]
+
+class PaymentHoldPayload(msgspec.Struct):
+    user_id: str
+    amount: int
+
+class ParticipantCommand(msgspec.Struct):
+    tx_id: str
+    command: str          # "hold" | "release" | "commit"
+    reply_to: str         # "coordinator.replies.{process_uuid}"
+    stock_payload: Optional[StockHoldPayload] = None
+    payment_payload: Optional[PaymentHoldPayload] = None
+
+class ParticipantReply(msgspec.Struct):
+    tx_id: str
+    service: str          # "stock" | "payment"
+    command: str          # "hold" | "release" | "commit"
+    ok: bool
+    error: Optional[str] = None   # error code when ok=False
+    details: Optional[dict] = None
+```
+
+Encoding/decoding:
+
+```python
+encoder = msgspec.msgpack.Encoder()
+decoder = msgspec.msgpack.Decoder(ParticipantCommand)  # or ParticipantReply
+
+# Publish
+body = encoder.encode(command)
+channel.basic_publish(..., body=body)
+
+# Consume
+command = decoder.decode(body)
+```
+
+Error codes for `ParticipantReply.error`: `"not_found"`, `"insufficient_stock"`, `"insufficient_credit"`, `"already_held"`, `"already_released"`, `"already_committed"`, `"tx_not_found"`.
+
+#### `common/constants.py` — shared enums
+
+```python
+# Command names
+CMD_HOLD = "hold"
+CMD_RELEASE = "release"
+CMD_COMMIT = "commit"
+
+# Service names
+SVC_STOCK = "stock"
+SVC_PAYMENT = "payment"
+
+# Tx status constants (also used by coordinator/models.py)
+STATUS_INIT = "init"
+STATUS_HOLDING = "holding"
+STATUS_HELD = "held"
+STATUS_COMMITTING = "committing"
+STATUS_COMPENSATING = "compensating"
+STATUS_COMPLETED = "completed"
+STATUS_ABORTED = "aborted"
+STATUS_FAILED_NEEDS_RECOVERY = "failed_needs_recovery"
+
+TERMINAL_STATUSES = {STATUS_COMPLETED, STATUS_ABORTED}
+```
+
+#### Why msgpack everywhere (not JSON for messages)
+
+1. The codebase already depends on `msgspec` for Redis. One serialization library means one set of Struct definitions that work for both Redis and RabbitMQ.
+2. `msgspec.msgpack` is significantly faster than `json.dumps`/`json.loads` — this matters under high message throughput.
+3. RabbitMQ management UI debugging is still possible via application-level structured logging (which already logs tx_id, command, and result for every message).
+4. Shared `msgspec.Struct` types in `common/models.py` give type safety and validation on both sides of the wire — malformed messages fail at decode time with a clear error.
+
+### Docker-Compose Changes
+
+Add RabbitMQ to docker-compose:
+
+```yaml
+rabbitmq:
+  image: rabbitmq:3-management
+  ports:
+    - "5672:5672"     # AMQP
+    - "15672:15672"   # Management UI (useful for debugging)
+  environment:
+    RABBITMQ_DEFAULT_USER: guest
+    RABBITMQ_DEFAULT_PASS: guest
+  healthcheck:
+    test: ["CMD", "rabbitmqctl", "status"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+```
+
+Add to all services:
+
+```yaml
+environment:
+  - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+```
+
+Add to order-service:
+
+```yaml
+environment:
+  - STOCK_SERVICE_URL=http://stock-service:5000
+  - PAYMENT_SERVICE_URL=http://payment-service:5000
+  - CHECKOUT_PROTOCOL=saga  # or 2pc
+depends_on:
+  rabbitmq:
+    condition: service_healthy
+```
+
+Add to stock-service and payment-service:
+
+```yaml
+environment:
+  - ORDER_SERVICE_URL=http://order-service:5000
+  - CHECKOUT_PROTOCOL=saga  # must match order-service
+depends_on:
+  rabbitmq:
+    condition: service_healthy
+```
+
+Update gunicorn commands:
+
+```yaml
+order-service:
+  command: gunicorn -b 0.0.0.0:5000 -w 8 --timeout 30 --log-level=info app:app
+
+stock-service:
+  command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
+
+payment-service:
+  command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
+```
+
+### Eliminate GATEWAY_URL from order service
+
+The current `order/app.py` routes **all** internal calls through the nginx gateway via `GATEWAY_URL`. Every one of these must be migrated to direct service URLs:
+
+| Current call (via gateway)                              | Replacement (direct)                                  | Used in            |
+|---------------------------------------------------------|-------------------------------------------------------|--------------------|
+| `{GATEWAY_URL}/stock/find/{item_id}`                    | `{STOCK_SERVICE_URL}/find/{item_id}`                  | `addItem` (lookup) |
+| `{GATEWAY_URL}/stock/add/{item_id}/{quantity}`          | handled by RabbitMQ `release` command                 | checkout rollback  |
+| `{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}`     | handled by RabbitMQ `hold` command                    | checkout           |
+| `{GATEWAY_URL}/payment/pay/{user_id}/{amount}`          | handled by RabbitMQ `hold` command                    | checkout           |
+
+After the rebuild:
+- `GATEWAY_URL` is removed entirely from `order/app.py` and `docker-compose.yml`.
+- `STOCK_SERVICE_URL` and `PAYMENT_SERVICE_URL` are the only service-to-service env vars.
+- Non-transactional HTTP lookups (e.g., `addItem` fetching item price) use direct URLs.
+- All transactional operations (hold/release/commit) go through RabbitMQ — no HTTP at all.
+- The nginx gateway handles **only** external client traffic.
 
 ## Core Invariants
 
@@ -1049,7 +1421,7 @@ The practical strategy is:
 4. Keep long-running recovery and reconciliation out of request threads.
 5. Use direct HTTP (bypassing nginx) only for non-transactional lookups (item price, user info). All transaction operations go through RabbitMQ.
 6. Use persistent RabbitMQ connections with channel pooling. Use `requests.Session` with connection pooling for any remaining HTTP calls.
-7. Keep serialization and Redis/message payloads compact (msgspec msgpack for Redis, JSON or msgpack for RabbitMQ messages).
+7. Keep serialization and Redis/message payloads compact (msgspec msgpack for both Redis values and RabbitMQ messages).
 8. Fail fast on overload or ambiguity instead of stalling enough requests to blow the latency budget.
 9. Use Lua scripts for all participant-side atomic operations. This is both a correctness and performance requirement.
 10. Set gunicorn worker counts high enough for the architecture. Starting values: `8` workers for order, `4` for stock and payment. Tune based on benchmark results.
@@ -1171,16 +1543,17 @@ The route also must not:
 Success path:
 
 1. Persist `INIT`.
-2. Publish reserve-stock and charge-payment commands **in parallel** to RabbitMQ (one message to stock queue, one to payment queue, both containing aggregated item/amount data).
+2. Publish hold commands to stock and payment **in parallel** via RabbitMQ (one message to stock queue, one to payment queue, both containing aggregated item/amount data).
 3. Wait for both participant replies on the coordinator reply queue (bounded timeout).
-4. If both succeed: mark order paid, mark transaction completed.
+4. If both succeed: mark order paid, publish `commit` commands to both participants (finalizes participant tx records), mark transaction completed.
 
 Failure path:
 
 1. If stock reserve fails but payment charge succeeded: publish refund command to payment. Wait for confirmation. Mark aborted.
 2. If payment charge fails but stock reserve succeeded: publish release command to stock. Wait for confirmation. Mark aborted.
-3. If both fail: mark aborted (no compensation needed).
-4. If a participant times out (no reply within deadline): treat as failure for that participant. Compensate the other if it succeeded. Mark `FAILED_NEEDS_RECOVERY` if compensation also fails.
+3. If both definitively fail (explicit failure replies): mark aborted (no compensation needed).
+4. If a participant times out (no reply within deadline): treat as "possibly succeeded" for compensation purposes. Always publish release/refund to timed-out participants — the participant's idempotent Lua script will no-op if the hold never happened (`tx_not_found`). Compensate the other participant if it succeeded. Mark `FAILED_NEEDS_RECOVERY` if compensation also fails.
+5. If both participants time out: publish release/refund to both. This is safe because release/refund on a non-existent tx record returns a harmless `tx_not_found` error. Mark `FAILED_NEEDS_RECOVERY` if either compensation fails; mark aborted if both succeed or return `tx_not_found`.
 
 Recovery policy:
 
@@ -1197,17 +1570,21 @@ Success path:
 1. Persist `INIT`.
 2. Publish prepare commands to stock and payment **in parallel** via RabbitMQ (stock prepare with aggregated items, payment prepare with user_id and total_cost).
 3. Wait for both prepare replies on the coordinator reply queue (bounded timeout).
-4. If both prepared successfully: persist durable commit decision (`tx_decision:{tx_id} = commit`).
-5. Set commit fence (`order_commit_fence:{order_id} = tx_id`).
-6. Publish commit commands to stock and payment **in parallel** via RabbitMQ.
-7. Wait for both commit confirmations.
-8. Finalize order as paid.
-9. Clear fence and mark completed.
+4. If both prepared successfully, execute the commit sequence in this exact order:
+   a. Write `tx_decision:{tx_id} = commit` (durable decision marker — must be first).
+   b. Write `order_commit_fence:{order_id} = tx_id` (commit fence).
+   c. Update tx status to `COMMITTING` (only after decision marker exists).
+   d. Publish commit commands to stock and payment **in parallel** via RabbitMQ.
+5. Wait for both commit confirmations.
+6. Finalize order as paid.
+7. Clear fence and mark completed.
+
+**Critical write ordering**: the decision marker (4a) must be persisted before the status changes to COMMITTING (4c). If the coordinator crashes after writing COMMITTING but before writing the decision marker, recovery would find COMMITTING + no decision → presumed abort, contradicting the intended commit. Writing the decision first ensures recovery always has the authoritative decision available.
 
 Failure path:
 
 1. If either prepare fails or times out: persist durable abort decision.
-2. Publish abort commands to all participants that may have prepared (in parallel).
+2. Publish abort commands to **all** participants (in parallel) — including timed-out ones that may have prepared. A timed-out participant may have executed the prepare; aborting it is safe because the abort Lua script no-ops with `tx_not_found` if the prepare never happened.
 3. Wait for abort confirmations.
 4. Mark terminal abort state.
 
@@ -1325,11 +1702,13 @@ What should happen:
    - configure dead-letter queues: `stock.commands.dlq`, `payment.commands.dlq`
    - all messages persistent (delivery_mode=2)
    - add `RABBITMQ_URL` environment variable to all services
-3. Implement the shared messaging layer:
-   - RabbitMQ connection helpers (connect, publish, consume)
-   - message contracts (command types: prepare, commit, abort, reserve, release, charge, refund; reply types: success, failure, timeout)
+3. Implement the `common/` shared package (imported by all services):
+   - `common/models.py`: `msgspec.Struct` definitions for `ParticipantCommand`, `ParticipantReply`, payload types
+   - `common/constants.py`: command names, service names, status constants, terminal status set
+   - `common/messaging.py`: RabbitMQ connection helpers (connect, publish, consume), thread-local publisher connections (as attempt 1 correctly did)
+   - `common/result.py`: structured result types for coordinator → route communication
+   - all RabbitMQ messages serialized with `msgspec.msgpack` (same library as Redis values)
    - correlation ID for matching replies to requests
-   - thread-local publisher connections (as attempt 1 correctly did — avoid sharing connections across threads)
 4. Implement participant RabbitMQ consumers in stock and payment:
    - consume from `stock.commands` / `payment.commands`
    - dispatch to Lua-based atomic operations
@@ -1365,7 +1744,7 @@ Validation:
 
 1. Write unit tests proving Lua-based subtract/add are atomic under concurrent access.
 2. Write idempotency tests for repeated `tx_id` participant operations (via RabbitMQ consumer).
-3. Write serialization/deserialization tests for transaction records.
+3. Write serialization/deserialization tests for `common/models.py` Struct types (round-trip encode/decode for all message types).
 4. Write a configuration test that invalid protocol values fail fast.
 5. Verify existing public API tests still pass.
 6. Verify RabbitMQ queues are created and messages flow end-to-end (publish command → consume → process → publish reply → consume reply).
@@ -1420,19 +1799,23 @@ Critical `FAILED_NEEDS_RECOVERY` handling (from attempt 2 bug):
 
 Timeout handling for RabbitMQ replies:
 
-- If a participant reply does not arrive within the deadline (e.g., 5 seconds), the coordinator treats it as a failure.
-- For SAGA: compensate the other participant if it succeeded.
-- For 2PC: abort (no commit decision has been written yet, so presumed abort is safe).
+- If a participant reply does not arrive within the deadline (e.g., 5 seconds), the coordinator treats the timed-out participant as "possibly succeeded."
+- For SAGA: always publish release/refund to timed-out participants (safe because the Lua script no-ops with `tx_not_found` if the hold never happened). Also compensate the other participant if it explicitly succeeded.
+- For 2PC: abort all participants (including timed-out ones). No commit decision has been written yet, so presumed abort is safe.
 - The transaction is marked `FAILED_NEEDS_RECOVERY` if compensation/abort also fails.
 - The recovery worker will re-publish commands later. Participants are idempotent, so re-delivery is safe.
 
 Validation:
 
 1. Write protocol-unit tests (no Flask) for:
-   - SAGA happy path (parallel reserve+charge), stock rejection, payment rejection, both reject
-   - 2PC happy path (parallel prepare), prepare rejection, timeout, crash after commit decision
+   - SAGA happy path (parallel hold → commit), stock rejection, payment rejection, both reject
+   - SAGA both-timeout: verify release/refund published to both timed-out participants (no orphaned holds)
+   - SAGA single-timeout: verify timed-out participant gets release/refund and succeeded participant gets compensated
+   - 2PC happy path (parallel prepare → commit decision → parallel commit), prepare rejection, timeout, crash after commit decision
+   - 2PC write ordering: verify decision marker written before status changes to COMMITTING
    - duplicate compensation/commit replay
    - SAGA partial success (stock OK, payment fail → compensate stock; payment OK, stock fail → compensate payment)
+   - partial reply persistence: verify participant flags updated during HOLDING (not deferred to transition)
 2. Write integration tests exercising the checkout route in both modes.
 3. Write tests proving already-paid returns `200` with no side effects.
 4. Write tests proving concurrent checkout on the same order produces at most one outcome.
@@ -1510,6 +1893,7 @@ What should happen:
    - kill stock service during checkout → coordinator detects failure, aborts or retries
    - kill payment service during checkout → same
    - kill a Redis instance → service reconnects, recovery picks up
+   - kill a RabbitMQ instance → the remaining replica takes over; at most one container is killed at a time, so the RabbitMQ cluster maintains quorum and durable queues remain available without manual intervention
 2. Fix any issues discovered during fault injection.
 3. Verify the system remains consistent after each failure scenario.
 
@@ -1541,8 +1925,12 @@ The following scenarios must be covered before considering the rebuild stable.
 12. The already-paid fast path returns `200` without entering full transaction coordination.
 13. Single-container failure (order, stock, payment, Redis, or RabbitMQ) followed by restart converges to consistent state.
 14. `FAILED_NEEDS_RECOVERY` does not clear the active-tx guard (attempt 2 bug — must not recur).
-15. RabbitMQ reply timeout triggers correct compensation/abort behavior.
+15. RabbitMQ reply timeout triggers correct compensation/abort behavior — including releasing timed-out participants that may have succeeded.
 16. Participant timeout (one participant replies, other times out) triggers correct partial-failure handling in both modes.
+17. Both-timeout scenario: both participants time out → release/abort published to both → no orphaned holds.
+18. Coordinator crash mid-HOLDING with one reply received → recovery sees partial flags → compensates correctly.
+19. 2PC commit decision marker is written before tx status changes to COMMITTING (write ordering).
+20. SAGA sends commit to participants after marking order paid → participant tx records reach terminal state.
 
 ## Benchmark Notes
 
@@ -1636,11 +2024,12 @@ This rebuild is ready for Phase 1 delivery when all of the following are true:
 8. Critical logic remains modular, with no duplicated recovery/protocol paths.
 9. Non-obvious correctness-critical code paths are commented clearly enough to explain why they are safe.
 10. All participant read-modify-write operations are atomic (Lua scripts).
-11. Internal transaction operations use RabbitMQ. Non-transactional lookups use direct HTTP. Nothing routes through nginx internally.
-12. Gunicorn worker counts are tuned for the architecture.
-13. Single-container failure followed by restart converges to a consistent state.
-14. Stock and payment operations execute in parallel via RabbitMQ fan-out.
-15. The architecture qualifies as event-driven for the assignment's difficulty scoring.
+11. Internal transaction operations use RabbitMQ with msgspec msgpack serialization. Non-transactional lookups use direct HTTP. Nothing routes through nginx internally.
+12. All RabbitMQ message types are defined as `msgspec.Struct` in `common/models.py` and imported by all services.
+13. Gunicorn worker counts are tuned for the architecture.
+14. Single-container failure followed by restart converges to a consistent state.
+15. Stock and payment operations execute in parallel via RabbitMQ fan-out.
+16. The architecture qualifies as event-driven for the assignment's difficulty scoring.
 
 ## Phase 2 Extraction Path
 

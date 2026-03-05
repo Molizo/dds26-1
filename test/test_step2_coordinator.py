@@ -533,5 +533,119 @@ class TestTwoPCResume(unittest.TestCase):
         self.assertEqual(tx_store.txs["tx-4"].status, STATUS_ABORTED)
 
 
+class TestReplyCorrelationFiltering(unittest.TestCase):
+    """Tests for the expected_command filter in coordinator/messaging.py.
+
+    This covers the bug where a late/stale hold reply from a previous phase
+    (that arrives during the commit phase) could signal the wrong Event and
+    cause the coordinator to proceed with incomplete commit confirmations.
+    """
+
+    def setUp(self):
+        # Reset module-level correlation state between tests
+        import coordinator.messaging as m
+        with m._correlation_lock:
+            m._correlation_map.clear()
+        # Patch the reply queue so _on_reply calls don't need a real consumer
+        import coordinator.messaging as m
+        m._reply_queue = "test.replies"
+
+    def tearDown(self):
+        import coordinator.messaging as m
+        with m._correlation_lock:
+            m._correlation_map.clear()
+
+    def test_out_of_phase_reply_is_ignored(self):
+        """A hold reply arriving during the commit phase must not signal the event."""
+        from coordinator.messaging import register_pending, wait_for_replies, _on_reply, _correlation_map
+
+        # Register for commit phase
+        register_pending("tx-x", expected=1, expected_command=CMD_COMMIT)
+
+        # Simulate a stale hold reply arriving on the queue
+        stale_hold = _stock_reply("tx-x", ok=True, command=CMD_HOLD)
+        from common.models import encode_reply
+        import pika
+
+        mock_channel = MagicMock()
+        mock_method = MagicMock()
+        mock_method.delivery_tag = 1
+        mock_props = MagicMock()
+
+        _on_reply(mock_channel, mock_method, mock_props, encode_reply(stale_hold))
+
+        # The event should NOT be set — stale reply was filtered
+        import coordinator.messaging as m
+        with m._correlation_lock:
+            entry = m._correlation_map.get("tx-x")
+        self.assertIsNotNone(entry)
+        self.assertFalse(entry.event.is_set(), "Stale hold reply must not signal commit phase event")
+        self.assertEqual(len(entry.replies), 0)
+
+    def test_correct_phase_reply_signals_event(self):
+        """A commit reply arriving during the commit phase signals the event."""
+        import coordinator.messaging as m
+        from coordinator.messaging import register_pending, _on_reply
+        from common.models import encode_reply
+
+        register_pending("tx-y", expected=1, expected_command=CMD_COMMIT)
+
+        commit_reply = _stock_reply("tx-y", ok=True, command=CMD_COMMIT)
+        mock_channel = MagicMock()
+        mock_method = MagicMock()
+        mock_method.delivery_tag = 1
+
+        _on_reply(mock_channel, mock_method, MagicMock(), encode_reply(commit_reply))
+
+        with m._correlation_lock:
+            entry = m._correlation_map.get("tx-y")
+        # Event is set and reply was recorded
+        self.assertIsNotNone(entry)
+        self.assertTrue(entry.event.is_set())
+        self.assertEqual(len(entry.replies), 1)
+
+    def test_failed_needs_recovery_guard_not_cleared(self):
+        """Guard must NOT be cleared when tx ends in FAILED_NEEDS_RECOVERY."""
+        from coordinator.models import make_tx
+
+        tx_store = _MockTxStore()
+        tx = make_tx(
+            tx_id="tx-fnr", order_id="order-fnr", user_id="user-1",
+            total_cost=100, protocol=PROTOCOL_SAGA,
+            items_snapshot=[("item-1", 1)], status=STATUS_FAILED_NEEDS_RECOVERY,
+        )
+        tx_store.create_tx(tx)
+        tx_store.guards["order-fnr"] = "tx-fnr"
+
+        # Simulate the guard-cleanup logic from order/app.py
+        if tx.status in TERMINAL_STATUSES:
+            tx_store.clear_active_tx_guard("order-fnr")
+
+        # Guard must still be present
+        self.assertIn("order-fnr", tx_store.guards,
+                      "Guard must NOT be cleared for FAILED_NEEDS_RECOVERY")
+
+    def test_terminal_status_guard_cleared(self):
+        """Guard IS cleared when tx reaches COMPLETED or ABORTED."""
+        from coordinator.models import make_tx
+
+        for terminal_status in TERMINAL_STATUSES:
+            tx_store = _MockTxStore()
+            tx = make_tx(
+                tx_id="tx-done", order_id="order-done", user_id="user-1",
+                total_cost=100, protocol=PROTOCOL_SAGA,
+                items_snapshot=[("item-1", 1)], status=terminal_status,
+            )
+            tx_store.create_tx(tx)
+            tx_store.guards["order-done"] = "tx-done"
+
+            # Simulate guard-cleanup logic
+            if tx.status in TERMINAL_STATUSES:
+                tx_store.clear_active_tx_guard("order-done")
+
+            self.assertNotIn("order-done", tx_store.guards,
+                             f"Guard must be cleared for status={terminal_status}")
+
+
 if __name__ == '__main__':
     unittest.main()

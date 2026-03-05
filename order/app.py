@@ -239,8 +239,11 @@ def checkout(order_id: str):
     coordinator = _get_coordinator()
     result: CheckoutResult = coordinator.execute_checkout(order_id, CHECKOUT_PROTOCOL, tx_id)
 
-    # Clear guard on terminal result (but NOT on FAILED_NEEDS_RECOVERY)
-    if result.success or result.status_code == 400:
+    # Clear guard only after the durable tx record reaches a terminal status.
+    # FAILED_NEEDS_RECOVERY returns 200/400 depending on phase, so HTTP status
+    # alone is not sufficient to decide guard cleanup safely.
+    tx_after = get_tx(db, tx_id)
+    if tx_after is not None and tx_after.status in TERMINAL_STATUSES:
         clear_active_tx_guard(db, order_id)
 
     # Map result to HTTP

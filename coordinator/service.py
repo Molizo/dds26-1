@@ -306,7 +306,7 @@ class CoordinatorService:
         Both are from the same reply list, just the full list twice for convenience.
         """
         reply_queue = get_reply_queue()
-        register_pending(tx.tx_id, expected=2)
+        register_pending(tx.tx_id, expected=2, expected_command=CMD_HOLD)
 
         try:
             # Build commands
@@ -354,7 +354,7 @@ class CoordinatorService:
             # Both already committed
             return self._finalize_completed(tx)
 
-        register_pending(tx.tx_id, expected=expected)
+        register_pending(tx.tx_id, expected=expected, expected_command=CMD_COMMIT)
 
         try:
             if need_stock:
@@ -410,7 +410,7 @@ class CoordinatorService:
         if expected == 0:
             return self._finalize_aborted(tx)
 
-        register_pending(tx.tx_id, expected=expected)
+        register_pending(tx.tx_id, expected=expected, expected_command=CMD_RELEASE)
 
         try:
             if need_stock:

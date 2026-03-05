@@ -31,8 +31,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class _PendingEntry:
-    """Slot for collecting participant replies for one tx_id."""
+    """Slot for collecting participant replies for one tx_id + command phase."""
     expected: int  # how many replies to wait for
+    expected_command: str  # hold / commit / release for this pending wait
     replies: list[ParticipantReply] = field(default_factory=list)
     event: threading.Event = field(default_factory=threading.Event)
 
@@ -51,13 +52,16 @@ def get_reply_queue() -> str:
     return _reply_queue
 
 
-def register_pending(tx_id: str, expected: int) -> None:
+def register_pending(tx_id: str, expected: int, expected_command: str) -> None:
     """Register a tx_id before publishing commands.
 
     expected: number of replies to wait for (typically 2: stock + payment).
     """
     with _correlation_lock:
-        _correlation_map[tx_id] = _PendingEntry(expected=expected)
+        _correlation_map[tx_id] = _PendingEntry(
+            expected=expected,
+            expected_command=expected_command,
+        )
 
 
 def wait_for_replies(tx_id: str, timeout: float) -> list[ParticipantReply]:
@@ -144,6 +148,15 @@ def _on_reply(channel, method, properties, body: bytes) -> None:
         if entry is None:
             # Stale reply for a tx_id we're not waiting on (timeout already passed)
             logger.debug("Ignoring stale reply for tx=%s service=%s", reply.tx_id, reply.service)
+            return
+        if reply.command != entry.expected_command:
+            logger.debug(
+                "Ignoring out-of-phase reply for tx=%s service=%s command=%s expected=%s",
+                reply.tx_id,
+                reply.service,
+                reply.command,
+                entry.expected_command,
+            )
             return
         entry.replies.append(reply)
         if len(entry.replies) >= entry.expected:

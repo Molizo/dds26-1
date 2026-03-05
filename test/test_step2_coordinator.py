@@ -389,6 +389,86 @@ class TestTwoPCProtocol(unittest.TestCase):
         self.assertLess(decision_idx, committing_idx,
                         "Decision must be written before COMMITTING status")
 
+    def test_2pc_mark_paid_before_completed(self, mock_queue, mock_publish):
+        """2PC: mark_paid must be called before STATUS_COMPLETED is written.
+
+        Verifies the P1 fix: crash after COMPLETED but before mark_paid would
+        leave a terminal tx with an unpaid order. The correct sequence is
+        commits → mark_paid → COMPLETED.
+        """
+        hold = [_stock_reply("tx", ok=True), _payment_reply("tx", ok=True)]
+        commit = [_stock_reply("tx", ok=True, command=CMD_COMMIT),
+                  _payment_reply("tx", ok=True, command=CMD_COMMIT)]
+
+        call_order = []
+        original_tx_store = _MockTxStore()
+        original_order_port = _MockOrderPort()
+
+        orig_mark_paid = original_order_port.mark_paid
+        orig_update_tx = original_tx_store.update_tx
+
+        def track_mark_paid(order_id, tx_id):
+            call_order.append("mark_paid")
+            return orig_mark_paid(order_id, tx_id)
+
+        def track_update_tx(tx):
+            call_order.append(("update_tx", tx.status))
+            return orig_update_tx(tx)
+
+        original_order_port.mark_paid = track_mark_paid
+        original_tx_store.update_tx = track_update_tx
+
+        result, _, _ = self._run(mock_queue, mock_publish,
+                                 hold_replies=hold, commit_replies=commit,
+                                 order_port=original_order_port,
+                                 tx_store=original_tx_store)
+
+        self.assertTrue(result.success)
+
+        paid_idx = call_order.index("mark_paid")
+        completed_idx = next(
+            i for i, c in enumerate(call_order)
+            if c == ("update_tx", STATUS_COMPLETED)
+        )
+        self.assertLess(paid_idx, completed_idx,
+                        "mark_paid must be called before STATUS_COMPLETED is persisted")
+
+    def test_2pc_mark_paid_failure_sets_failed_needs_recovery(self, mock_queue, mock_publish):
+        """2PC: if mark_paid fails after commits, status becomes FAILED_NEEDS_RECOVERY, not COMPLETED."""
+        hold = [_stock_reply("tx", ok=True), _payment_reply("tx", ok=True)]
+        commit = [_stock_reply("tx", ok=True, command=CMD_COMMIT),
+                  _payment_reply("tx", ok=True, command=CMD_COMMIT)]
+
+        order_port = _MockOrderPort()
+        order_port.mark_paid = lambda order_id, tx_id: False  # always fails
+
+        result, op, ts = self._run(mock_queue, mock_publish,
+                                   hold_replies=hold, commit_replies=commit,
+                                   order_port=order_port)
+
+        self.assertFalse(result.success)
+        tx = list(ts.txs.values())[0]
+        self.assertNotEqual(tx.status, STATUS_COMPLETED,
+                            "COMPLETED must never be written when mark_paid fails")
+        self.assertEqual(tx.status, STATUS_FAILED_NEEDS_RECOVERY)
+        self.assertEqual(tx.last_error, "mark_paid_failed")
+
+    def test_2pc_commit_incomplete_order_not_paid(self, mock_queue, mock_publish):
+        """2PC: if commits don't confirm, order must NOT be marked paid."""
+        hold = [_stock_reply("tx", ok=True), _payment_reply("tx", ok=True)]
+        commit = []  # no commit replies — timeout
+
+        result, op, ts = self._run(mock_queue, mock_publish,
+                                   hold_replies=hold, commit_replies=commit)
+
+        # Result is failure (order is not paid in 2PC until commits confirmed)
+        self.assertFalse(result.success)
+        # Order must NOT have been marked paid
+        self.assertEqual(len(op.mark_paid_calls), 0,
+                         "mark_paid must not be called when 2PC commits are incomplete")
+        tx = list(ts.txs.values())[0]
+        self.assertEqual(tx.status, STATUS_FAILED_NEEDS_RECOVERY)
+
 
 class TestAggregateItems(unittest.TestCase):
 
@@ -408,6 +488,37 @@ class TestAggregateItems(unittest.TestCase):
 
 class TestSagaResume(unittest.TestCase):
     """Test resume_transaction for SAGA recovery paths."""
+
+    @patch("coordinator.service.publish_command")
+    @patch("coordinator.service.get_reply_queue", return_value="test.replies")
+    def test_resume_committing_returns_checkout_result(self, mock_queue, mock_publish):
+        """Recovery: COMMITTING SAGA returns CheckoutResult, not a bare bool."""
+        order_port = _MockOrderPort(snapshot=_make_snapshot(paid=True))
+        tx_store = _MockTxStore()
+
+        tx = make_tx(
+            tx_id="tx-saga-commit", order_id="order-1", user_id="user-1",
+            total_cost=100, protocol=PROTOCOL_SAGA,
+            items_snapshot=[("item-1", 2)], status=STATUS_COMMITTING,
+        )
+        tx.stock_held = True
+        tx.payment_held = True
+        tx.decision = "commit"
+        tx_store.create_tx(tx)
+
+        coordinator = CoordinatorService("amqp://test", order_port, tx_store)
+
+        commit_replies = [_stock_reply("tx-saga-commit", ok=True, command=CMD_COMMIT),
+                          _payment_reply("tx-saga-commit", ok=True, command=CMD_COMMIT)]
+
+        with patch("coordinator.service.register_pending"), \
+             patch("coordinator.service.wait_for_replies", return_value=commit_replies), \
+             patch("coordinator.service.cancel_pending"):
+            result = coordinator.resume_transaction(tx)
+
+        self.assertIsInstance(result, CheckoutResult)
+        self.assertTrue(result.success)
+        self.assertEqual(tx_store.txs["tx-saga-commit"].status, STATUS_COMPLETED)
 
     @patch("coordinator.service.publish_command")
     @patch("coordinator.service.get_reply_queue", return_value="test.replies")
@@ -505,6 +616,41 @@ class TestTwoPCResume(unittest.TestCase):
 
     @patch("coordinator.service.publish_command")
     @patch("coordinator.service.get_reply_queue", return_value="test.replies")
+    def test_resume_2pc_mark_paid_failure_sets_failed_needs_recovery(self, mock_queue, mock_publish):
+        """Recovery 2PC: mark_paid failure after commits → FAILED_NEEDS_RECOVERY, not COMPLETED."""
+        order_port = _MockOrderPort(snapshot=_make_snapshot(paid=False))
+        order_port.mark_paid = lambda order_id, tx_id: False  # always fails
+        tx_store = _MockTxStore()
+
+        tx = make_tx(
+            tx_id="tx-rmp", order_id="order-1", user_id="user-1",
+            total_cost=100, protocol=PROTOCOL_2PC,
+            items_snapshot=[("item-1", 2)], status=STATUS_COMMITTING,
+        )
+        tx.stock_held = True
+        tx.payment_held = True
+        tx.decision = "commit"
+        tx_store.create_tx(tx)
+        tx_store.set_decision("tx-rmp", "commit")
+
+        coordinator = CoordinatorService("amqp://test", order_port, tx_store)
+
+        commit_replies = [_stock_reply("tx-rmp", ok=True, command=CMD_COMMIT),
+                          _payment_reply("tx-rmp", ok=True, command=CMD_COMMIT)]
+
+        with patch("coordinator.service.register_pending"), \
+             patch("coordinator.service.wait_for_replies", return_value=commit_replies), \
+             patch("coordinator.service.cancel_pending"):
+            result = coordinator.resume_transaction(tx)
+
+        self.assertFalse(result.success)
+        self.assertNotEqual(tx_store.txs["tx-rmp"].status, STATUS_COMPLETED,
+                            "COMPLETED must never be written when mark_paid fails")
+        self.assertEqual(tx_store.txs["tx-rmp"].status, STATUS_FAILED_NEEDS_RECOVERY)
+        self.assertEqual(tx_store.txs["tx-rmp"].last_error, "mark_paid_failed")
+
+    @patch("coordinator.service.publish_command")
+    @patch("coordinator.service.get_reply_queue", return_value="test.replies")
     def test_resume_no_decision_presumed_abort(self, mock_queue, mock_publish):
         """Recovery: no commit decision → presumed abort."""
         order_port = _MockOrderPort(snapshot=_make_snapshot(paid=False))
@@ -559,8 +705,9 @@ class TestReplyCorrelationFiltering(unittest.TestCase):
         """A hold reply arriving during the commit phase must not signal the event."""
         from coordinator.messaging import register_pending, wait_for_replies, _on_reply, _correlation_map
 
-        # Register for commit phase
-        register_pending("tx-x", expected=1, expected_command=CMD_COMMIT)
+        # Register for commit phase (waiting only on stock)
+        register_pending("tx-x", expected_command=CMD_COMMIT,
+                         expected_services=frozenset({SVC_STOCK}))
 
         # Simulate a stale hold reply arriving on the queue
         stale_hold = _stock_reply("tx-x", ok=True, command=CMD_HOLD)
@@ -582,13 +729,40 @@ class TestReplyCorrelationFiltering(unittest.TestCase):
         self.assertFalse(entry.event.is_set(), "Stale hold reply must not signal commit phase event")
         self.assertEqual(len(entry.replies), 0)
 
+    def test_duplicate_service_reply_ignored(self):
+        """Two replies from the same service must not double-satisfy the wait."""
+        import coordinator.messaging as m
+        from coordinator.messaging import register_pending, _on_reply
+        from common.models import encode_reply
+
+        register_pending("tx-dup", expected_command=CMD_COMMIT,
+                         expected_services=frozenset({SVC_STOCK, SVC_PAYMENT}))
+
+        first = _stock_reply("tx-dup", ok=True, command=CMD_COMMIT)
+        second = _stock_reply("tx-dup", ok=True, command=CMD_COMMIT)  # duplicate
+        mock_channel = MagicMock()
+        mock_method = MagicMock()
+        mock_method.delivery_tag = 1
+
+        _on_reply(mock_channel, mock_method, MagicMock(), encode_reply(first))
+        _on_reply(mock_channel, mock_method, MagicMock(), encode_reply(second))
+
+        with m._correlation_lock:
+            entry = m._correlation_map.get("tx-dup")
+        self.assertIsNotNone(entry)
+        # Event must NOT be set — only 1 unique service replied, need 2
+        self.assertFalse(entry.event.is_set(),
+                         "Duplicate service reply must not satisfy expected=2 wait")
+        self.assertEqual(len(entry.replies), 1, "Only one reply should be stored")
+
     def test_correct_phase_reply_signals_event(self):
         """A commit reply arriving during the commit phase signals the event."""
         import coordinator.messaging as m
         from coordinator.messaging import register_pending, _on_reply
         from common.models import encode_reply
 
-        register_pending("tx-y", expected=1, expected_command=CMD_COMMIT)
+        register_pending("tx-y", expected_command=CMD_COMMIT,
+                         expected_services=frozenset({SVC_STOCK}))
 
         commit_reply = _stock_reply("tx-y", ok=True, command=CMD_COMMIT)
         mock_channel = MagicMock()
@@ -603,6 +777,31 @@ class TestReplyCorrelationFiltering(unittest.TestCase):
         self.assertIsNotNone(entry)
         self.assertTrue(entry.event.is_set())
         self.assertEqual(len(entry.replies), 1)
+
+    def test_wrong_service_reply_ignored(self):
+        """A reply from an unexpected service must not satisfy the wait."""
+        import coordinator.messaging as m
+        from coordinator.messaging import register_pending, _on_reply
+        from common.models import encode_reply
+
+        # Register waiting only on payment
+        register_pending("tx-ws", expected_command=CMD_COMMIT,
+                         expected_services=frozenset({SVC_PAYMENT}))
+
+        # Deliver a stock commit reply (wrong service for this wait)
+        stock_commit = _stock_reply("tx-ws", ok=True, command=CMD_COMMIT)
+        mock_channel = MagicMock()
+        mock_method = MagicMock()
+        mock_method.delivery_tag = 1
+
+        _on_reply(mock_channel, mock_method, MagicMock(), encode_reply(stock_commit))
+
+        with m._correlation_lock:
+            entry = m._correlation_map.get("tx-ws")
+        self.assertIsNotNone(entry)
+        self.assertFalse(entry.event.is_set(),
+                         "Stock reply must not satisfy a wait registered for payment only")
+        self.assertEqual(len(entry.replies), 0)
 
     def test_failed_needs_recovery_guard_not_cleared(self):
         """Guard must NOT be cleared when tx ends in FAILED_NEEDS_RECOVERY."""

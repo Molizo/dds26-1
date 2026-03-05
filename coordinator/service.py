@@ -140,12 +140,12 @@ class CoordinatorService:
 
     def _saga_commit(self, tx: CheckoutTxValue) -> CheckoutResult:
         """SAGA commit: mark order paid, then send commit commands."""
-        # Mark order paid (idempotent)
+        # Mark order paid (idempotent) before entering COMMITTING
         if not self._orders.mark_paid(tx.order_id, tx.tx_id):
             tx.last_error = "mark_paid_failed"
             return self._saga_compensate(tx)
 
-        # Persist decision
+        # Persist decision + fence
         self._tx.set_decision(tx.tx_id, "commit")
         self._tx.set_commit_fence(tx.order_id, tx.tx_id)
 
@@ -153,8 +153,12 @@ class CoordinatorService:
         tx.decision = "commit"
         self._tx.update_tx(tx)
 
-        # Publish commit commands to finalize participant tx records
-        return self._publish_commits(tx)
+        # Publish commit commands to finalize participant tx records.
+        # Order is already paid; if commits are incomplete, return ok and let
+        # recovery retry the commits.
+        if self._publish_commits(tx):
+            return self._finalize_completed(tx)
+        return CheckoutResult.ok()  # order IS paid; recovery will confirm commits
 
     def _saga_compensate(self, tx: CheckoutTxValue) -> CheckoutResult:
         """SAGA compensate: release all participants that may have succeeded."""
@@ -178,13 +182,19 @@ class CoordinatorService:
         if tx.status == STATUS_COMMITTING or order_paid:
             # Forward recovery: order is paid, just need to finalize commits
             if not order_paid:
-                self._orders.mark_paid(tx.order_id, tx.tx_id)
+                if not self._orders.mark_paid(tx.order_id, tx.tx_id):
+                    tx.status = STATUS_FAILED_NEEDS_RECOVERY
+                    tx.last_error = "mark_paid_failed"
+                    self._tx.update_tx(tx)
+                    return CheckoutResult.fail("mark_paid_failed")
             if tx.decision != "commit":
                 tx.decision = "commit"
                 self._tx.set_decision(tx.tx_id, "commit")
             tx.status = STATUS_COMMITTING
             self._tx.update_tx(tx)
-            return self._publish_commits(tx)
+            if self._publish_commits(tx):
+                return self._finalize_completed(tx)
+            return CheckoutResult.ok()
 
         if tx.status == STATUS_COMPENSATING:
             return self._publish_releases(tx)
@@ -230,8 +240,21 @@ class CoordinatorService:
             return self._2pc_abort(tx)
 
     def _2pc_commit(self, tx: CheckoutTxValue) -> CheckoutResult:
-        """2PC commit: persist decision FIRST, then publish commits."""
-        # Critical write ordering: decision before status change
+        """2PC commit: persist decision FIRST, then commits, then mark paid.
+
+        Write ordering:
+          1. set_decision (durable commit marker)
+          2. set_commit_fence
+          3. status → COMMITTING (persisted)
+          4. publish commit commands + wait for confirmations
+          5. mark_paid   ← must be durable before COMPLETED
+          6. _finalize_completed (status → COMPLETED, clear fence)
+
+        Crashing between steps 4–5 or 5–6 is safe: recovery finds the
+        commit decision/fence, re-publishes commits, marks paid, and
+        finalizes. The order is NOT considered paid until step 5 succeeds,
+        so no other checkout can start (the guard is still held).
+        """
         self._tx.set_decision(tx.tx_id, "commit")
         self._tx.set_commit_fence(tx.order_id, tx.tx_id)
 
@@ -239,13 +262,18 @@ class CoordinatorService:
         tx.decision = "commit"
         self._tx.update_tx(tx)
 
-        result = self._publish_commits(tx)
+        if not self._publish_commits(tx):
+            # Commits incomplete — FAILED_NEEDS_RECOVERY already set.
+            # Order is NOT paid; recovery will re-publish commits.
+            return CheckoutResult.fail("commit_confirmation_incomplete")
 
-        # After commits confirmed, mark order paid
-        if result.success:
-            self._orders.mark_paid(tx.order_id, tx.tx_id)
-
-        return result
+        # Commits confirmed — now mark order paid, then finalize.
+        if not self._orders.mark_paid(tx.order_id, tx.tx_id):
+            tx.status = STATUS_FAILED_NEEDS_RECOVERY
+            tx.last_error = "mark_paid_failed"
+            self._tx.update_tx(tx)
+            return CheckoutResult.fail("mark_paid_failed")
+        return self._finalize_completed(tx)
 
     def _2pc_abort(self, tx: CheckoutTxValue) -> CheckoutResult:
         """2PC abort: presumed abort — release all participants."""
@@ -282,10 +310,16 @@ class CoordinatorService:
                 self._tx.set_decision(tx.tx_id, "commit")
             tx.status = STATUS_COMMITTING
             self._tx.update_tx(tx)
-            result = self._publish_commits(tx)
-            if result.success and not order_paid:
-                self._orders.mark_paid(tx.order_id, tx.tx_id)
-            return result
+            if not self._publish_commits(tx):
+                return CheckoutResult.fail("commit_confirmation_incomplete")
+            # Commits confirmed — mark paid (idempotent) then finalize
+            if not order_paid:
+                if not self._orders.mark_paid(tx.order_id, tx.tx_id):
+                    tx.status = STATUS_FAILED_NEEDS_RECOVERY
+                    tx.last_error = "mark_paid_failed"
+                    self._tx.update_tx(tx)
+                    return CheckoutResult.fail("mark_paid_failed")
+            return self._finalize_completed(tx)
 
         # No commit decision → presumed abort
         if tx.status == STATUS_COMPENSATING:
@@ -306,7 +340,8 @@ class CoordinatorService:
         Both are from the same reply list, just the full list twice for convenience.
         """
         reply_queue = get_reply_queue()
-        register_pending(tx.tx_id, expected=2, expected_command=CMD_HOLD)
+        register_pending(tx.tx_id, expected_command=CMD_HOLD,
+                         expected_services=frozenset({SVC_STOCK, SVC_PAYMENT}))
 
         try:
             # Build commands
@@ -341,20 +376,28 @@ class CoordinatorService:
             cancel_pending(tx.tx_id)
             return [], []
 
-    def _publish_commits(self, tx: CheckoutTxValue) -> CheckoutResult:
-        """Publish commit commands and wait for confirmations."""
-        reply_queue = get_reply_queue()
+    def _publish_commits(self, tx: CheckoutTxValue) -> bool:
+        """Publish commit commands and wait for confirmations.
 
+        Updates participant flags and persists the tx record, but does NOT
+        finalize (no status change to COMPLETED, no fence clear, no mark_paid).
+        Returns True if all needed commits were confirmed, False otherwise.
+        Callers are responsible for the correct finalization sequence.
+        """
         # Determine which participants still need commits
         need_stock = not tx.stock_committed
         need_payment = not tx.payment_committed
-        expected = (1 if need_stock else 0) + (1 if need_payment else 0)
+        expected_services = frozenset(
+            ({SVC_STOCK} if need_stock else set()) |
+            ({SVC_PAYMENT} if need_payment else set())
+        )
 
-        if expected == 0:
-            # Both already committed
-            return self._finalize_completed(tx)
+        if not expected_services:
+            return True  # already done
 
-        register_pending(tx.tx_id, expected=expected, expected_command=CMD_COMMIT)
+        reply_queue = get_reply_queue()
+        register_pending(tx.tx_id, expected_command=CMD_COMMIT,
+                         expected_services=expected_services)
 
         try:
             if need_stock:
@@ -381,7 +424,6 @@ class CoordinatorService:
             cancel_pending(tx.tx_id)
             replies = []
 
-        # Process replies
         for r in replies:
             if r.service == SVC_STOCK and r.ok:
                 tx.stock_committed = True
@@ -389,14 +431,13 @@ class CoordinatorService:
                 tx.payment_committed = True
         self._tx.update_tx(tx)
 
-        if tx.stock_committed and tx.payment_committed:
-            return self._finalize_completed(tx)
-        else:
-            # Some commits didn't confirm — recovery will retry
+        if not (tx.stock_committed and tx.payment_committed):
             tx.status = STATUS_FAILED_NEEDS_RECOVERY
             tx.last_error = "commit_confirmation_incomplete"
             self._tx.update_tx(tx)
-            return CheckoutResult.ok()  # order IS paid, just commits pending
+            return False
+
+        return True
 
     def _publish_releases(self, tx: CheckoutTxValue) -> CheckoutResult:
         """Publish release/refund commands and wait for confirmations."""
@@ -405,12 +446,16 @@ class CoordinatorService:
         # Release all participants that may have succeeded (including timed-out ones)
         need_stock = not tx.stock_released
         need_payment = not tx.payment_released
-        expected = (1 if need_stock else 0) + (1 if need_payment else 0)
+        expected_services = frozenset(
+            ({SVC_STOCK} if need_stock else set()) |
+            ({SVC_PAYMENT} if need_payment else set())
+        )
 
-        if expected == 0:
+        if not expected_services:
             return self._finalize_aborted(tx)
 
-        register_pending(tx.tx_id, expected=expected, expected_command=CMD_RELEASE)
+        register_pending(tx.tx_id, expected_command=CMD_RELEASE,
+                         expected_services=expected_services)
 
         try:
             if need_stock:

@@ -32,9 +32,10 @@ logger = logging.getLogger(__name__)
 @dataclass
 class _PendingEntry:
     """Slot for collecting participant replies for one tx_id + command phase."""
-    expected: int  # how many replies to wait for
     expected_command: str  # hold / commit / release for this pending wait
+    expected_services: frozenset  # set of service names we are waiting on
     replies: list[ParticipantReply] = field(default_factory=list)
+    replied_services: set = field(default_factory=set)  # dedup by service name
     event: threading.Event = field(default_factory=threading.Event)
 
 
@@ -52,15 +53,16 @@ def get_reply_queue() -> str:
     return _reply_queue
 
 
-def register_pending(tx_id: str, expected: int, expected_command: str) -> None:
+def register_pending(tx_id: str, expected_command: str, expected_services: frozenset) -> None:
     """Register a tx_id before publishing commands.
 
-    expected: number of replies to wait for (typically 2: stock + payment).
+    expected_services: frozenset of service names whose replies are required
+    (e.g. frozenset({"stock", "payment"})).
     """
     with _correlation_lock:
         _correlation_map[tx_id] = _PendingEntry(
-            expected=expected,
             expected_command=expected_command,
+            expected_services=expected_services,
         )
 
 
@@ -158,6 +160,23 @@ def _on_reply(channel, method, properties, body: bytes) -> None:
                 entry.expected_command,
             )
             return
+        if reply.service not in entry.expected_services:
+            logger.debug(
+                "Ignoring unexpected-service reply for tx=%s service=%s command=%s",
+                reply.tx_id,
+                reply.service,
+                reply.command,
+            )
+            return
+        if reply.service in entry.replied_services:
+            logger.debug(
+                "Ignoring duplicate reply for tx=%s service=%s command=%s",
+                reply.tx_id,
+                reply.service,
+                reply.command,
+            )
+            return
+        entry.replied_services.add(reply.service)
         entry.replies.append(reply)
-        if len(entry.replies) >= entry.expected:
+        if entry.replied_services >= entry.expected_services:
             entry.event.set()

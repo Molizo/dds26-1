@@ -84,13 +84,23 @@ class RecoveryWorker:
         for tx in txs:
             if tx.status in TERMINAL_STATUSES:
                 continue
-            if now_ms - tx.updated_at < self._stale_age_ms:
+            if not self._is_stale(tx, now_ms):
                 continue
 
             if not self._acquire_recovery_lock(tx.tx_id):
                 continue
             try:
-                recovered += self._recover_one(tx, reason=reason)
+                latest = self._tx.get_tx(tx.tx_id) or tx
+                if latest.status in TERMINAL_STATUSES:
+                    continue
+                # Re-check staleness after lock acquisition to avoid duplicate
+                # sequential recoveries from stale pre-lock snapshots.
+                if not self._is_stale(latest, now_ms):
+                    continue
+
+                recovered += self._recover_one(latest, reason=reason, now_ms=now_ms)
+            except Exception:
+                logger.exception("Recovery scan (%s) failed tx=%s", reason, tx.tx_id)
             finally:
                 self._release_recovery_lock(tx.tx_id)
 
@@ -99,19 +109,28 @@ class RecoveryWorker:
         return recovered
 
     def _run(self) -> None:
-        self.run_scan_once(reason="startup")
-        while not self._stop_event.wait(self._scan_interval_seconds):
-            self.run_scan_once(reason="periodic")
-
-    def _recover_one(self, tx: CheckoutTxValue, reason: str) -> int:
-        """Resume one stale tx if guards allow it. Returns 1 if resumed."""
-        if not self._claim_active_guard(tx):
-            return 0
-
         try:
+            self.run_scan_once(reason="startup")
+        except Exception:
+            logger.exception("Recovery worker startup scan crashed")
+
+        while not self._stop_event.wait(self._scan_interval_seconds):
+            try:
+                self.run_scan_once(reason="periodic")
+            except Exception:
+                logger.exception("Recovery worker periodic scan crashed")
+
+    def _recover_one(self, tx: CheckoutTxValue, reason: str, now_ms: int) -> int:
+        """Resume one stale tx if guards allow it. Returns 1 if resumed."""
+        try:
+            if not self._claim_active_guard(tx):
+                return 0
+
             latest = self._tx.get_tx(tx.tx_id) or tx
             if latest.status in TERMINAL_STATUSES:
                 self._clear_guard_if_owned(latest.order_id, latest.tx_id)
+                return 0
+            if not self._is_stale(latest, now_ms):
                 return 0
 
             logger.info(
@@ -129,6 +148,9 @@ class RecoveryWorker:
             logger.exception("Recovery resume failed tx=%s", tx.tx_id)
             self._refresh_guard_if_owned(tx.order_id, tx.tx_id)
             return 0
+
+    def _is_stale(self, tx: CheckoutTxValue, now_ms: int) -> bool:
+        return (now_ms - tx.updated_at) >= self._stale_age_ms
 
     def _claim_active_guard(self, tx: CheckoutTxValue) -> bool:
         """Ensure this tx owns the active-tx guard before recovery work."""
@@ -158,12 +180,26 @@ class RecoveryWorker:
         self._refresh_guard_if_owned(order_id, tx_id)
 
     def _clear_guard_if_owned(self, order_id: str, tx_id: str) -> None:
-        if self._tx.get_active_tx_guard(order_id) == tx_id:
-            self._tx.clear_active_tx_guard(order_id)
+        try:
+            if self._tx.get_active_tx_guard(order_id) == tx_id:
+                self._tx.clear_active_tx_guard(order_id)
+        except Exception:
+            logger.exception(
+                "Failed clearing active tx guard order=%s tx=%s",
+                order_id,
+                tx_id,
+            )
 
     def _refresh_guard_if_owned(self, order_id: str, tx_id: str) -> None:
-        if self._tx.get_active_tx_guard(order_id) == tx_id:
-            self._tx.refresh_active_tx_guard(order_id, ACTIVE_TX_GUARD_TTL)
+        try:
+            if self._tx.get_active_tx_guard(order_id) == tx_id:
+                self._tx.refresh_active_tx_guard(order_id, ACTIVE_TX_GUARD_TTL)
+        except Exception:
+            logger.exception(
+                "Failed refreshing active tx guard order=%s tx=%s",
+                order_id,
+                tx_id,
+            )
 
     def _acquire_recovery_lock(self, tx_id: str) -> bool:
         """Best-effort per-tx lock; falls back to always-true if unavailable."""
@@ -209,4 +245,3 @@ def start_recovery_worker(
         )
         _worker.start()
         return _worker
-

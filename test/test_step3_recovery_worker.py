@@ -1,6 +1,7 @@
 """Unit tests for Step 3: recovery worker scanning behavior."""
 import os
 import sys
+import time
 import unittest
 
 _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -208,6 +209,59 @@ class TestRecoveryWorker(unittest.TestCase):
             coordinator=coordinator,
             tx_store=tx_store,
             stale_age_seconds=0,
+        )
+        recovered = worker.run_scan_once(reason="periodic")
+
+        self.assertEqual(recovered, 0)
+        self.assertEqual(coordinator.calls, [])
+
+    def test_scan_continues_when_guard_lookup_raises(self):
+        class _FlakyGuardTxStore(_MockTxStore):
+            def __init__(self):
+                super().__init__()
+                self._fail_once_order_ids = {"order-err"}
+
+            def get_active_tx_guard(self, order_id):
+                if order_id in self._fail_once_order_ids:
+                    self._fail_once_order_ids.remove(order_id)
+                    raise RuntimeError("redis temporarily unavailable")
+                return super().get_active_tx_guard(order_id)
+
+        tx_store = _FlakyGuardTxStore()
+        tx_store.create_tx(_make_stale_tx("tx-err", "order-err", STATUS_HOLDING))
+        tx_store.create_tx(_make_stale_tx("tx-ok", "order-ok", STATUS_HOLDING))
+        coordinator = _MockCoordinator(tx_store, next_status=STATUS_COMPLETED)
+
+        worker = RecoveryWorker(
+            coordinator=coordinator,
+            tx_store=tx_store,
+            stale_age_seconds=0,
+        )
+        recovered = worker.run_scan_once(reason="periodic")
+
+        self.assertEqual(recovered, 1)
+        self.assertEqual(coordinator.calls, ["tx-ok"])
+
+    def test_scan_revalidates_staleness_after_lock_acquire(self):
+        class _FresheningLockTxStore(_MockTxStore):
+            def acquire_recovery_lock(self, tx_id, ttl):
+                acquired = super().acquire_recovery_lock(tx_id, ttl)
+                if acquired:
+                    tx = self.txs[tx_id]
+                    tx.updated_at = int(time.time() * 1000)
+                    self.update_tx(tx)
+                return acquired
+
+        tx_store = _FresheningLockTxStore()
+        tx = _make_stale_tx("tx-7", "order-7", STATUS_HOLDING, stale_seconds=120)
+        tx_store.create_tx(tx)
+        tx_store.guards["order-7"] = "tx-7"
+        coordinator = _MockCoordinator(tx_store, next_status=STATUS_FAILED_NEEDS_RECOVERY)
+
+        worker = RecoveryWorker(
+            coordinator=coordinator,
+            tx_store=tx_store,
+            stale_age_seconds=30,
         )
         recovered = worker.run_scan_once(reason="periodic")
 

@@ -66,6 +66,7 @@ Required outcomes:
 15. All read-modify-write operations on participant state (stock, credit) must be atomic at the Redis level using Lua scripts or `WATCH`/`MULTI`/`EXEC`. Non-atomic `GET` then `SET` patterns are treated as correctness bugs.
 16. Internal transaction operations use RabbitMQ. Non-transactional lookups use direct service URLs. Nothing internal routes through the nginx gateway.
 17. Gunicorn worker counts must be tuned for the synchronous blocking call pattern; 2 workers is insufficient for any meaningful throughput.
+18. Redis/Lua performance optimizations must stay behind `OrderPort`/`TxStorePort` and store adapters; coordinator protocol semantics must not move into Redis scripts.
 
 ## Explicit Decision Record
 
@@ -1770,6 +1771,8 @@ What should happen:
 9. Add `GET /internal/tx_decision/{tx_id}` to the order service for participant startup reconciliation queries.
 10. Create the coordinator package skeleton with result types and protocol interface. Verify it has no Flask imports.
 11. Set up the `CHECKOUT_PROTOCOL` environment variable with fail-fast validation.
+12. Add centralized domain validation helpers where needed so validation ownership stays single-source per domain path.
+13. Move order-side state mutations that are currently multi-step into Redis-atomic store operations (Lua or equivalent atomic primitive).
 
 Key design choices from attempt 1 to preserve:
 
@@ -1835,6 +1838,11 @@ What should happen:
    - call coordinator
    - map structured result to HTTP
    - clear guard on terminal state
+7. Standardize coordinator durable-write call sites onto canonical TxStore methods:
+   - `set_decision_and_update_tx`
+   - `set_decision_fence_and_update_tx`
+   - `update_tx`
+   Keep compatibility only until all adapters implement the canonical surface; then remove duplicate fallback branches.
 
 Critical `FAILED_NEEDS_RECOVERY` handling (from attempt 2 bug):
 
@@ -1893,6 +1901,7 @@ What should happen:
    - no commit decision → presumed abort → publish abort commands to all participants
    - commit fence exists but order not paid → complete forward
 7. Recovery issues explicit abort/release commands for stale prepared holds.
+8. Replace full `tx_index` scans with indexed stale-candidate selection (e.g., `ZSET` by `updated_at`) while keeping the same recovery API and idempotent convergence semantics.
 
 Validation:
 
@@ -1952,6 +1961,29 @@ Acceptance criteria:
 1. Single-container failure does not cause permanent inconsistency.
 2. The system recovers to a consistent state within a bounded time after the failed container restarts.
 
+## Lean/Safety Refactor Addendum (2026-03-06)
+
+This addendum captures the agreed lean-refactor direction:
+
+1. Safety-first trimming:
+   - do not remove "duplicate-looking" writes/branches unless invariants are locked by tests
+   - preserve decision/fence ordering and recovery convergence semantics
+2. Strong Phase 2 boundary:
+   - keep coordinator semantics in coordinator code
+   - keep Redis-specific optimization in store adapters and port implementations
+3. Canonical write surface:
+   - consolidate coordinator persistence through canonical TxStore methods
+   - remove legacy fallback branches after adapter parity is achieved
+4. Lean recovery candidate selection:
+   - prefer indexed stale tx lookup over full scans to reduce Redis background load
+
+Implementation gate for this addendum:
+
+1. Existing consistency and recovery tests must pass unchanged.
+2. New addendum-specific tests must pass.
+3. Coordinator unit tests must remain storage-agnostic (no Redis coupling).
+4. Any removed branch must be justified by passing invariant tests, not by code-size preference alone.
+
 ## Testing Priorities
 
 The following scenarios must be covered before considering the rebuild stable.
@@ -1976,6 +2008,8 @@ The following scenarios must be covered before considering the rebuild stable.
 18. Coordinator crash mid-HOLDING with one reply received → recovery sees partial flags → compensates correctly.
 19. 2PC commit decision marker is written before tx status changes to COMMITTING (write ordering).
 20. SAGA sends commit to participants after marking order paid → participant tx records reach terminal state.
+21. Recovery candidate lookup uses indexed stale selection and avoids full tx scans under load while preserving convergence.
+22. Coordinator logic remains extractable by swapping `OrderPort`/`TxStorePort` implementations only.
 
 ## Benchmark Notes
 

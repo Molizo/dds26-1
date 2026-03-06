@@ -182,11 +182,9 @@ class CoordinatorService:
                     tx.last_error = "mark_paid_failed"
                     self._tx.update_tx(tx)
                     return CheckoutResult.fail("mark_paid_failed")
-            if tx.decision != "commit":
-                tx.decision = "commit"
-                self._tx.set_decision(tx.tx_id, "commit")
             tx.status = STATUS_COMMITTING
-            self._tx.update_tx(tx)
+            tx.decision = "commit"
+            self._persist_decision_and_update_tx(tx.tx_id, "commit", tx)
             if self._publish_commits(tx):
                 return self._finalize_completed(tx)
             return CheckoutResult.ok()
@@ -293,11 +291,9 @@ class CoordinatorService:
             decision = "commit"
 
         if decision == "commit":
-            if tx.decision != "commit":
-                tx.decision = "commit"
-                self._tx.set_decision(tx.tx_id, "commit")
             tx.status = STATUS_COMMITTING
-            self._tx.update_tx(tx)
+            tx.decision = "commit"
+            self._persist_decision_and_update_tx(tx.tx_id, "commit", tx)
             if not self._publish_commits(tx):
                 return CheckoutResult.fail("commit_confirmation_incomplete")
             # Commits confirmed — mark paid (idempotent) then finalize

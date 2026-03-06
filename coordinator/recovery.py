@@ -73,18 +73,17 @@ class RecoveryWorker:
     def run_scan_once(self, reason: str = "periodic") -> int:
         """Run one recovery scan and return how many txs were resumed."""
         now_ms = int(time.time() * 1000)
+        stale_before_ms = now_ms - self._stale_age_ms
         recovered = 0
 
         try:
-            txs = self._tx.get_non_terminal_txs()
+            txs = self._tx.get_stale_non_terminal_txs(stale_before_ms, batch_limit=50)
         except Exception as exc:
             logger.error("Recovery scan (%s) failed to load tx list: %s", reason, exc)
             return 0
 
         for tx in txs:
             if tx.status in TERMINAL_STATUSES:
-                continue
-            if not self._is_stale(tx, now_ms):
                 continue
 
             if not self._acquire_recovery_lock(tx.tx_id):

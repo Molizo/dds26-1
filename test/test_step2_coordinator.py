@@ -77,8 +77,11 @@ class _MockTxStore:
     def get_tx(self, tx_id):
         return self.txs.get(tx_id)
 
-    def get_non_terminal_txs(self):
-        return [tx for tx in self.txs.values() if tx.status not in TERMINAL_STATUSES]
+    def get_stale_non_terminal_txs(self, stale_before_ms, batch_limit=50):
+        return [
+            tx for tx in self.txs.values()
+            if tx.status not in TERMINAL_STATUSES and tx.updated_at <= stale_before_ms
+        ]
 
     def set_decision(self, tx_id, decision):
         self.decisions[tx_id] = decision

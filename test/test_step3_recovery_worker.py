@@ -37,8 +37,11 @@ class _MockTxStore:
     def get_tx(self, tx_id):
         return self.txs.get(tx_id)
 
-    def get_non_terminal_txs(self):
-        return [tx for tx in self.txs.values() if tx.status not in TERMINAL_STATUSES]
+    def get_stale_non_terminal_txs(self, stale_before_ms, batch_limit=50):
+        return [
+            tx for tx in self.txs.values()
+            if tx.status not in TERMINAL_STATUSES and tx.updated_at <= stale_before_ms
+        ]
 
     def acquire_active_tx_guard(self, order_id, tx_id, ttl):
         if order_id in self.guards:

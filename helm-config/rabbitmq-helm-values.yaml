@@ -15,7 +15,7 @@ auth:
   username: guest
   password: guest
 
-replicaCount: 6
+replicaCount: 7
 
 clustering:
   enabled: true

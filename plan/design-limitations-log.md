@@ -987,6 +987,23 @@ Use this log to avoid repeating known mistakes and to justify walking back earli
   - Happy-path SAGA reduced from ~12 to ~8 Redis writes (~33% reduction). Each pipeline saves 1–2 network round-trips.
   - Recovery correctness is preserved: the decision marker and tx record are written atomically in the same pipeline, and the held flags are always persisted before any commit/compensate commands are published.
 
+## 2026-03-06 - TxStore optimization introduced an incompatible coordinator contract
+
+- Limitation encountered:
+  - Coordinator commit/abort paths started calling `set_decision_and_update_tx` and `set_decision_fence_and_update_tx` directly, which fails for valid legacy `TxStore` implementations that only provide `set_decision`, `set_commit_fence`, and `update_tx`.
+
+- Why the current design caused it:
+  - The write-optimization change implicitly treated new combined methods as mandatory and did not include an adapter/fallback path.
+
+- Impact:
+  - **Reliability risk (high)**: checkout paths can fail with `AttributeError` at runtime on stores or mocks that were previously compatible.
+  - **Delivery risk (medium)**: coordinator protocol unit tests break unless every `TxStore` implementation is updated in lockstep.
+
+- Chosen mitigation or follow-up action:
+  - Add coordinator-local compatibility helpers that prefer combined methods when available.
+  - Fallback to the legacy sequence (`set_decision`, optional `set_commit_fence`, then `update_tx`) when combined methods are absent.
+  - Keep the optimization for Redis-backed stores while preserving portability to existing `TxStore` implementations.
+
 ## Update Rules
 
 When adding a new entry:

@@ -143,10 +143,11 @@ class CoordinatorService:
             tx.last_error = "mark_paid_failed"
             return self._saga_compensate(tx)
 
-        # Persist decision + fence + status in one Redis pipeline
+        # Persist decision + fence + status, using combined TxStore call
+        # when available and a legacy-compatible fallback otherwise.
         tx.status = STATUS_COMMITTING
         tx.decision = "commit"
-        self._tx.set_decision_fence_and_update_tx(tx.tx_id, "commit", tx.order_id, tx)
+        self._persist_decision_fence_and_update_tx(tx.tx_id, "commit", tx.order_id, tx)
 
         # Publish commit commands to finalize participant tx records.
         # Order is already paid; if commits are incomplete, return ok and let
@@ -159,7 +160,7 @@ class CoordinatorService:
         """SAGA compensate: release all participants that may have succeeded."""
         tx.status = STATUS_COMPENSATING
         tx.decision = "abort"
-        self._tx.set_decision_and_update_tx(tx.tx_id, "abort", tx)
+        self._persist_decision_and_update_tx(tx.tx_id, "abort", tx)
 
         return self._publish_releases(tx)
 
@@ -235,7 +236,8 @@ class CoordinatorService:
         """2PC commit: persist decision FIRST, then commits, then mark paid.
 
         Write ordering:
-          1. set_decision + set_commit_fence + status → COMMITTING (pipelined)
+          1. Persist decision + commit fence + status → COMMITTING
+             (combined call when supported, legacy sequence otherwise)
           2. publish commit commands + wait for confirmations
           3. mark_paid   ← must be durable before COMPLETED
           4. _finalize_completed (status → COMPLETED, clear fence)
@@ -247,7 +249,7 @@ class CoordinatorService:
         """
         tx.status = STATUS_COMMITTING
         tx.decision = "commit"
-        self._tx.set_decision_fence_and_update_tx(tx.tx_id, "commit", tx.order_id, tx)
+        self._persist_decision_fence_and_update_tx(tx.tx_id, "commit", tx.order_id, tx)
 
         if not self._publish_commits(tx):
             # Commits incomplete — FAILED_NEEDS_RECOVERY already set.
@@ -266,7 +268,7 @@ class CoordinatorService:
         """2PC abort: presumed abort — release all participants."""
         tx.status = STATUS_COMPENSATING
         tx.decision = "abort"
-        self._tx.set_decision_and_update_tx(tx.tx_id, "abort", tx)
+        self._persist_decision_and_update_tx(tx.tx_id, "abort", tx)
 
         return self._publish_releases(tx)
 
@@ -312,6 +314,44 @@ class CoordinatorService:
             return self._publish_releases(tx)
 
         return self._2pc_abort(tx)
+
+    # ------------------------------------------------------------------
+    # Tx persistence compatibility helpers
+    # ------------------------------------------------------------------
+
+    def _persist_decision_and_update_tx(
+        self,
+        tx_id: str,
+        decision: str,
+        tx: CheckoutTxValue,
+    ) -> None:
+        """Use combined decision+update call when available, else fallback."""
+        combined = getattr(self._tx, "set_decision_and_update_tx", None)
+        if callable(combined):
+            combined(tx_id, decision, tx)
+            return
+
+        # Backward-compatible sequence for older TxStore implementations.
+        self._tx.set_decision(tx_id, decision)
+        self._tx.update_tx(tx)
+
+    def _persist_decision_fence_and_update_tx(
+        self,
+        tx_id: str,
+        decision: str,
+        order_id: str,
+        tx: CheckoutTxValue,
+    ) -> None:
+        """Use combined decision+fence+update call when available, else fallback."""
+        combined = getattr(self._tx, "set_decision_fence_and_update_tx", None)
+        if callable(combined):
+            combined(tx_id, decision, order_id, tx)
+            return
+
+        # Backward-compatible sequence for older TxStore implementations.
+        self._tx.set_decision(tx_id, decision)
+        self._tx.set_commit_fence(order_id, tx_id)
+        self._tx.update_tx(tx)
 
     # ------------------------------------------------------------------
     # Shared mechanics: publish and wait

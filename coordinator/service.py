@@ -119,13 +119,11 @@ class CoordinatorService:
         stock_reply = _find_reply(stock_replies, SVC_STOCK)
         payment_reply = _find_reply(payment_replies, SVC_PAYMENT)
 
-        # Update flags incrementally as replies arrive
+        # Update flags from replies — batch into one persist
         if stock_reply and stock_reply.ok:
             tx.stock_held = True
-            self._tx.update_tx(tx)
         if payment_reply and payment_reply.ok:
             tx.payment_held = True
-            self._tx.update_tx(tx)
 
         # --- Decision ---
         if tx.stock_held and tx.payment_held:
@@ -134,8 +132,8 @@ class CoordinatorService:
             return self._saga_commit(tx)
         else:
             # At least one failed or timed out — compensate
-            error = _hold_error(stock_reply, payment_reply)
-            tx.last_error = error
+            # held flags + error will be persisted by _saga_compensate's update_tx
+            tx.last_error = _hold_error(stock_reply, payment_reply)
             return self._saga_compensate(tx)
 
     def _saga_commit(self, tx: CheckoutTxValue) -> CheckoutResult:
@@ -145,13 +143,10 @@ class CoordinatorService:
             tx.last_error = "mark_paid_failed"
             return self._saga_compensate(tx)
 
-        # Persist decision + fence
-        self._tx.set_decision(tx.tx_id, "commit")
-        self._tx.set_commit_fence(tx.order_id, tx.tx_id)
-
+        # Persist decision + fence + status in one Redis pipeline
         tx.status = STATUS_COMMITTING
         tx.decision = "commit"
-        self._tx.update_tx(tx)
+        self._tx.set_decision_fence_and_update_tx(tx.tx_id, "commit", tx.order_id, tx)
 
         # Publish commit commands to finalize participant tx records.
         # Order is already paid; if commits are incomplete, return ok and let
@@ -164,8 +159,7 @@ class CoordinatorService:
         """SAGA compensate: release all participants that may have succeeded."""
         tx.status = STATUS_COMPENSATING
         tx.decision = "abort"
-        self._tx.set_decision(tx.tx_id, "abort")
-        self._tx.update_tx(tx)
+        self._tx.set_decision_and_update_tx(tx.tx_id, "abort", tx)
 
         return self._publish_releases(tx)
 
@@ -225,42 +219,35 @@ class CoordinatorService:
 
         if stock_reply and stock_reply.ok:
             tx.stock_held = True
-            self._tx.update_tx(tx)
         if payment_reply and payment_reply.ok:
             tx.payment_held = True
-            self._tx.update_tx(tx)
 
         if tx.stock_held and tx.payment_held:
             tx.status = STATUS_HELD
             self._tx.update_tx(tx)
             return self._2pc_commit(tx)
         else:
-            error = _hold_error(stock_reply, payment_reply)
-            tx.last_error = error
+            # held flags + error will be persisted by _2pc_abort's update_tx
+            tx.last_error = _hold_error(stock_reply, payment_reply)
             return self._2pc_abort(tx)
 
     def _2pc_commit(self, tx: CheckoutTxValue) -> CheckoutResult:
         """2PC commit: persist decision FIRST, then commits, then mark paid.
 
         Write ordering:
-          1. set_decision (durable commit marker)
-          2. set_commit_fence
-          3. status → COMMITTING (persisted)
-          4. publish commit commands + wait for confirmations
-          5. mark_paid   ← must be durable before COMPLETED
-          6. _finalize_completed (status → COMPLETED, clear fence)
+          1. set_decision + set_commit_fence + status → COMMITTING (pipelined)
+          2. publish commit commands + wait for confirmations
+          3. mark_paid   ← must be durable before COMPLETED
+          4. _finalize_completed (status → COMPLETED, clear fence)
 
-        Crashing between steps 4–5 or 5–6 is safe: recovery finds the
+        Crashing between steps 2–3 or 3–4 is safe: recovery finds the
         commit decision/fence, re-publishes commits, marks paid, and
-        finalizes. The order is NOT considered paid until step 5 succeeds,
+        finalizes. The order is NOT considered paid until step 3 succeeds,
         so no other checkout can start (the guard is still held).
         """
-        self._tx.set_decision(tx.tx_id, "commit")
-        self._tx.set_commit_fence(tx.order_id, tx.tx_id)
-
         tx.status = STATUS_COMMITTING
         tx.decision = "commit"
-        self._tx.update_tx(tx)
+        self._tx.set_decision_fence_and_update_tx(tx.tx_id, "commit", tx.order_id, tx)
 
         if not self._publish_commits(tx):
             # Commits incomplete — FAILED_NEEDS_RECOVERY already set.
@@ -279,8 +266,7 @@ class CoordinatorService:
         """2PC abort: presumed abort — release all participants."""
         tx.status = STATUS_COMPENSATING
         tx.decision = "abort"
-        self._tx.set_decision(tx.tx_id, "abort")
-        self._tx.update_tx(tx)
+        self._tx.set_decision_and_update_tx(tx.tx_id, "abort", tx)
 
         return self._publish_releases(tx)
 

@@ -189,6 +189,26 @@ def set_decision(db: redis.Redis, tx_id: str, decision: str) -> None:
     db.set(f"tx_decision:{tx_id}", decision)
 
 
+def set_decision_and_update_tx(
+    db: redis.Redis, tx_id: str, decision: str, tx: CheckoutTxValue,
+) -> None:
+    """Pipeline: set_decision + update_tx in one round-trip."""
+    updated = CheckoutTxValue(
+        tx_id=tx.tx_id, order_id=tx.order_id, user_id=tx.user_id,
+        total_cost=tx.total_cost, protocol=tx.protocol, status=tx.status,
+        decision=tx.decision, items_snapshot=tx.items_snapshot,
+        stock_held=tx.stock_held, stock_committed=tx.stock_committed,
+        stock_released=tx.stock_released, payment_held=tx.payment_held,
+        payment_committed=tx.payment_committed, payment_released=tx.payment_released,
+        last_error=tx.last_error, created_at=tx.created_at,
+        updated_at=int(time.time() * 1000), retry_count=tx.retry_count,
+    )
+    pipe = db.pipeline(transaction=False)
+    pipe.set(f"tx_decision:{tx_id}", decision)
+    pipe.set(_tx_key(tx_id), _tx_encoder.encode(updated))
+    pipe.execute()
+
+
 def get_decision(db: redis.Redis, tx_id: str) -> Optional[str]:
     raw = db.get(f"tx_decision:{tx_id}")
     return raw.decode() if raw else None
@@ -207,6 +227,28 @@ def set_commit_fence(db: redis.Redis, order_id: str, tx_id: str) -> None:
     commit commands.
     """
     db.set(f"order_commit_fence:{order_id}", tx_id)
+
+
+def set_decision_fence_and_update_tx(
+    db: redis.Redis, tx_id: str, decision: str,
+    order_id: str, tx: CheckoutTxValue,
+) -> None:
+    """Pipeline: set_decision + set_commit_fence + update_tx in one round-trip."""
+    updated = CheckoutTxValue(
+        tx_id=tx.tx_id, order_id=tx.order_id, user_id=tx.user_id,
+        total_cost=tx.total_cost, protocol=tx.protocol, status=tx.status,
+        decision=tx.decision, items_snapshot=tx.items_snapshot,
+        stock_held=tx.stock_held, stock_committed=tx.stock_committed,
+        stock_released=tx.stock_released, payment_held=tx.payment_held,
+        payment_committed=tx.payment_committed, payment_released=tx.payment_released,
+        last_error=tx.last_error, created_at=tx.created_at,
+        updated_at=int(time.time() * 1000), retry_count=tx.retry_count,
+    )
+    pipe = db.pipeline(transaction=False)
+    pipe.set(f"tx_decision:{tx_id}", decision)
+    pipe.set(f"order_commit_fence:{order_id}", tx_id)
+    pipe.set(_tx_key(tx_id), _tx_encoder.encode(updated))
+    pipe.execute()
 
 
 def get_commit_fence(db: redis.Redis, order_id: str) -> Optional[str]:

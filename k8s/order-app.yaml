@@ -5,7 +5,7 @@ metadata:
 spec:
   type: ClusterIP
   selector:
-    component: order
+    app: order-service
   ports:
     - port: 5000
       name: http
@@ -19,37 +19,41 @@ spec:
   replicas: 1
   selector:
     matchLabels:
-      component: order
+      app: order-service
   template:
     metadata:
       labels:
-        component: order
+        app: order-service
     spec:
       containers:
         - name: order
           image: ttl.sh/dds26-1-order:24h
+          imagePullPolicy: IfNotPresent
+          command: ["gunicorn", "-b", "0.0.0.0:5000", "-w", "4", "--threads", "10", "-k", "gthread", "-c", "gunicorn.conf.py", "--timeout", "30", "--log-level=info", "app:app"]
           resources:
-            limits:
-              memory: "1Gi"
-              cpu: "1"
             requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
               memory: "1Gi"
-              cpu: "1"
-          command: ["gunicorn"]
-          args: ["-b", "0.0.0.0:5000", "app:app"]
           ports:
             - containerPort: 5000
           env:
-            - name: GATEWAY_URL
-              value: "http://nginx-ingress-nginx-controller:80"
-            - name: USER_SERVICE_URL
-              value: "user-service"
             - name: STOCK_SERVICE_URL
-              value: "stock-service"
+              value: "http://stock-service:5000"
+            - name: PAYMENT_SERVICE_URL
+              value: "http://payment-service:5000"
+            - name: RABBITMQ_URL
+              value: "amqp://guest:guest@rabbitmq:5672/"
+            - name: COORDINATOR_REPLY_PREFETCH_COUNT
+              value: "64"
+            - name: CHECKOUT_PROTOCOL
+              value: "saga"
             - name: REDIS_HOST
-              value: redis-master
+              value: "order-db"
             - name: REDIS_PORT
-              value: '6379'
+              value: "6379"
             - name: REDIS_PASSWORD
               value: "redis"
             - name: REDIS_DB

@@ -792,6 +792,201 @@ Use this log to avoid repeating known mistakes and to justify walking back earli
   - Recovery scanner acquires this lock before resuming a stale tx and releases it afterward.
   - Keep all repair logic centralized in `CoordinatorService.resume_transaction(...)`; the lock only serializes who is allowed to invoke it.
 
+## 2026-03-06 - Kubernetes manifests drifted from docker-compose runtime topology
+
+- Limitation encountered:
+  - The `k8s/` manifests used legacy service naming and infrastructure wiring (`user-service`, shared `redis-master`) that no longer matched the active docker-compose deployment (`payment-service`, per-service Redis, RabbitMQ-backed coordination).
+
+- Why the current design caused it:
+  - Compose and Kubernetes configs evolved independently, so naming and environment contracts diverged over time.
+
+- Impact:
+  - **Reliability risk (high)**: services can start with wrong dependencies or missing env wiring (RabbitMQ URLs, protocol flags), causing startup/runtime failures.
+  - **Delivery risk (medium)**: local validation in compose does not transfer to Kubernetes, increasing deployment troubleshooting time.
+
+- Chosen mitigation or follow-up action:
+  - Align Kubernetes manifests to compose conventions:
+  - Rename `user-service` to `payment-service`.
+  - Use compose-equivalent service env vars and gunicorn command lines.
+  - Add dedicated Redis deployments/services (`order-db`, `stock-db`, `payment-db`).
+  - Add RabbitMQ deployment/service with compose-equivalent defaults.
+  - Keep ingress route prefixes (`/orders`, `/stock`, `/payment`) unchanged.
+
+## 2026-03-06 - Shared Redis requires isolation beyond host-level separation
+
+**SUPERSEDED on 2026-03-06** by "Dedicated Redis per service retained for environment parity" below.
+
+- Limitation encountered:
+  - When all services use one Redis instance, overlapping key names (for example batch-init keys like `"0"`, `"1"`) can collide.
+
+- Why the current design caused it:
+  - The service data model does not namespace top-level keys across services by default.
+
+- Impact:
+  - **Consistency risk (high)**: order, stock, and payment data can overwrite each other in the same logical Redis DB.
+
+- Chosen mitigation or follow-up action:
+  - Keep one shared Redis host.
+  - Isolate services with separate logical DB indexes (`order=0`, `stock=1`, `payment=2`).
+  - Point all Kubernetes services to the same Redis host (`redis-master`).
+
+## 2026-03-06 - Dedicated Redis per service retained for environment parity
+
+- Limitation encountered:
+  - A shared-Redis topology in Kubernetes diverged from the active docker-compose topology and introduced an extra DB-index coordination concern.
+
+- Why the current design caused it:
+  - Shared Redis reduces infrastructure count, but this codebase currently assumes service-level storage isolation and uses overlapping key patterns.
+
+- Impact:
+  - **Reliability risk (medium)**: accidental DB-index misconfiguration can silently mix data across services.
+  - **Delivery risk (medium)**: deployment behavior differs between compose and Kubernetes, making debugging less predictable.
+
+- Chosen mitigation or follow-up action:
+  - Revert Kubernetes to dedicated Redis instances (`order-db`, `stock-db`, `payment-db`) with `REDIS_DB=0` per service.
+  - Keep shared-Redis as an optional future optimization only if key-prefixing or stricter config guards are added.
+
+## 2026-03-06 - Shared Redis topology should not coexist with per-service Redis deployments
+
+- Limitation encountered:
+  - The cluster had both Helm Redis (`redis-master`/`redis-replicas`) and separate `order-db`/`stock-db`/`payment-db` deployments at the same time.
+
+- Why the current design caused it:
+  - Topology changes were applied incrementally without fully removing obsolete resources.
+
+- Impact:
+  - **Delivery risk (medium)**: unclear operational ownership and wasted cluster resources.
+  - **Reliability risk (medium)**: confusion about which Redis path is authoritative for application traffic.
+
+- Chosen mitigation or follow-up action:
+  - Standardize on shared Helm Redis for application state.
+  - Point all services to `redis-master` and isolate keys via DB indexes (`order=0`, `stock=1`, `payment=2`).
+  - Remove obsolete service-local Redis deployments/services from manifests and live cluster.
+
+## 2026-03-06 - CPU autoscaling needs both metrics-server and CPU requests
+
+- Limitation encountered:
+  - HPA cannot scale by CPU when the Metrics API is unavailable or when target deployments do not define CPU requests.
+
+- Why the current design caused it:
+  - The base cluster setup did not include `metrics-server`.
+  - Service deployments had no resource requests, so utilization percentages were undefined for HPA decisions.
+
+- Impact:
+  - **Reliability risk (medium)**: autoscaling objects exist but remain non-functional.
+  - **Performance risk (medium)**: services stay fixed at one replica under load, causing avoidable saturation.
+
+- Chosen mitigation or follow-up action:
+  - Add `metrics-server` installation to `deploy-charts-cluster.sh`.
+  - Add CPU/memory requests and limits to order, stock, and payment deployments.
+  - Add `autoscaling/v2` HPA resources with CPU utilization targets for all three service deployments.
+
+## 2026-03-06 - Redis write nodes should not be horizontally autoscaled by pod count
+
+- Limitation encountered:
+  - Naively applying HPA to standalone Redis write deployments can create multiple independent primaries behind one service and split state.
+
+- Why the current design caused it:
+  - The service-level Redis instances are single-node primaries without replication/sentinel orchestration.
+
+- Impact:
+  - **Consistency risk (high)**: requests can hit different Redis pods with divergent data.
+
+- Chosen mitigation or follow-up action:
+  - Keep service-local Redis primaries single-instance.
+  - Introduce Redis scaling on the Bitnami replication chart by enabling replica autoscaling (`replica.autoscaling.*`) in `helm-config/redis-helm-values.yaml`.
+  - Keep app-tier HPA independent and cap order-service HPA max replicas at 15.
+
+## 2026-03-06 - Shared state infrastructure became the dominant checkout bottleneck
+
+- Limitation encountered:
+  - Locust checkout-only load saturated shared `redis-master` and single-node RabbitMQ, driving median checkout latency into multi-second range and capping throughput.
+
+- Why the current design caused it:
+  - Redis for order/stock/payment was consolidated onto one primary.
+  - RabbitMQ ran as a single deployment pod for all command/reply traffic.
+  - Participant consumer flow control stayed at a conservative prefetch setting.
+
+- Impact:
+  - **Performance risk (high)**: throughput collapsed under queueing despite app-tier HPA scaling.
+  - **Reliability risk (medium)**: one overloaded infra pod became a system-wide chokepoint.
+
+- Chosen mitigation or follow-up action:
+  - Revert Kubernetes back to dedicated Redis instances per service (`order-db`, `stock-db`, `payment-db`) to remove cross-service write contention.
+  - Replace plain RabbitMQ deployment with Bitnami RabbitMQ Helm cluster at odd cardinality (`replicaCount=3`).
+  - Increase participant-side parallelism via higher stock/payment gunicorn workers and configurable RabbitMQ consumer prefetch.
+  - Keep Redis primaries at a single replica count in HPA (`maxReplicas=1`) to avoid split-brain writes.
+
+## 2026-03-06 - Bitnami chart defaults referenced unavailable public image tags
+
+- Limitation encountered:
+  - RabbitMQ StatefulSet pods failed with `ImagePullBackOff` for default chart image tags (`bitnami/rabbitmq` and `bitnami/os-shell`).
+
+- Why the current design caused it:
+  - The chart defaults target Bitnami image tags that are no longer publicly pullable in this environment.
+
+- Impact:
+  - **Delivery risk (high)**: deployment appears successful at Helm level but leaves broker unavailable at runtime.
+  - **Reliability risk (high)**: all checkout traffic depending on RabbitMQ fails or retries indefinitely.
+
+- Chosen mitigation or follow-up action:
+  - Override chart images to `bitnamilegacy/rabbitmq` and `bitnamilegacy/os-shell`.
+  - Set `global.security.allowInsecureImages=true` as required by chart validation for non-default image registries.
+  - Roll the stuck RabbitMQ pod after upgrade so it picks up the new StatefulSet template.
+
+## 2026-03-06 - HPA semantics are misleading for single-primary Redis
+
+- Limitation encountered:
+  - `order-db-hpa` repeatedly reported as "struggling" while `maxReplicas=1`, even though pod scaling is intentionally disabled to avoid split-brain writes.
+
+- Why the current design caused it:
+  - Utilization-based HPA (`% of CPU request`) is a poor signal for a fixed single-primary datastore.
+  - Single-primary Redis cannot be safely scaled by replica count behind one write service in this topology.
+
+- Impact:
+  - **Reliability risk (medium)**: operators can misinterpret HPA alerts as an autoscaling failure instead of a topology limit.
+  - **Performance risk (medium)**: effort goes into tuning HPA thresholds instead of addressing vertical capacity and workload profile.
+
+- Chosen mitigation or follow-up action:
+  - Keep `order-db` fixed at one replica.
+  - Tune `order-db-hpa` to absolute CPU (`averageValue`) for observability instead of percentage of request.
+  - Increase `order-db` vertical capacity and run Redis in no-persistence mode for PoC load tests.
+
+## 2026-03-06 - Gunicorn sync workers serialized checkout concurrency
+
+- Limitation encountered:
+  - Order service used gunicorn sync workers (`-w 10`), meaning each process could handle only one request at a time. Since checkout blocks on `Event.wait()` during RabbitMQ round-trips (~50–150 ms per phase, two phases per checkout), each worker was idle-waiting for most of the request lifecycle. With 12 HPA pods × 10 workers = 120 max concurrent checkouts. At ~100 ms per checkout, theoretical throughput capped at ~1200 RPS.
+
+- Why the current design caused it:
+  - The default gunicorn worker class (`sync`) was inherited from earlier development where blocking I/O was not the dominant cost. Checkout's wait-for-reply pattern turns every worker process into a single-threaded blocking slot.
+
+- Impact:
+  - **Performance risk (high)**: checkout throughput was bounded by process count × round-trip time, not by CPU or network capacity. Adding more pods only partially helped because each pod's 10 workers were underutilized during waits.
+
+- Chosen mitigation or follow-up action:
+  - Switch order service to `gthread` worker class: `-w 4 --threads 10 -k gthread`.
+  - Each pod now handles 40 concurrent requests (4 processes × 10 threads). 12 pods × 40 = 480 concurrent checkouts — a 4× increase.
+  - Thread-safety is already ensured: publisher connections are thread-local, correlation map is lock-protected, Redis client is thread-safe.
+  - Stock and payment services remain sync workers — their HTTP endpoints do not block on RabbitMQ (only the background consumer thread does).
+
+## 2026-03-06 - Excessive per-step Redis writes in coordinator checkout path
+
+- Limitation encountered:
+  - A successful SAGA checkout performed ~12 individual Redis writes: `create_tx`, `update_tx` (HOLDING), `update_tx` (stock_held), `update_tx` (payment_held), `update_tx` (HELD), `set_decision`, `set_commit_fence`, `update_tx` (COMMITTING), `update_tx` (committed flags), `mark_paid`, `update_tx` (COMPLETED), `clear_commit_fence`. Each write is a separate network round-trip to `order-db`.
+
+- Why the current design caused it:
+  - The coordinator persisted every incremental state change for crash-recovery safety. Per-reply `update_tx` calls (stock_held, payment_held) and separate `set_decision` / `set_commit_fence` / `update_tx` calls were designed for maximum recoverability but created unnecessary round-trips when both replies arrive in the same `wait_for_replies` call.
+
+- Impact:
+  - **Performance risk (high)**: at 800 RPS, ~9600 Redis writes/sec just from tx management, contributing to `order-db` CPU saturation.
+  - **Latency risk (medium)**: each round-trip adds ~0.5–1 ms, so 4 extra writes add 2–4 ms per checkout.
+
+- Chosen mitigation or follow-up action:
+  - Batch per-reply held flags into the decision-phase `update_tx` call (both `_run_saga` and `_run_2pc`). Flags are set in memory immediately but persisted once at the decision boundary.
+  - Pipeline `set_decision` + `set_commit_fence` + `update_tx` into a single Redis pipeline (`set_decision_fence_and_update_tx`) for the commit path. Pipeline `set_decision` + `update_tx` into `set_decision_and_update_tx` for the abort/compensate path.
+  - Happy-path SAGA reduced from ~12 to ~8 Redis writes (~33% reduction). Each pipeline saves 1–2 network round-trips.
+  - Recovery correctness is preserved: the decision marker and tx record are written atomically in the same pipeline, and the held flags are always persisted before any commit/compensate commands are published.
+
 ## Update Rules
 
 When adding a new entry:

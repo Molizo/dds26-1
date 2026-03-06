@@ -13,6 +13,7 @@ Thread-safety:
 - Publisher connections are thread-local (handled by common.messaging).
 """
 import logging
+import os
 import threading
 import time
 import uuid
@@ -24,6 +25,20 @@ import pika
 from common.models import ParticipantReply, decode_reply
 
 logger = logging.getLogger(__name__)
+
+
+def _get_positive_int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+        if parsed > 0:
+            return parsed
+    except ValueError:
+        pass
+    logger.warning("Invalid %s=%r, using default=%d", name, value, default)
+    return default
 
 # ---------------------------------------------------------------------------
 # Correlation map
@@ -117,13 +132,14 @@ def init_reply_consumer(rabbitmq_url: str) -> threading.Thread:
 def _run_reply_consumer(rabbitmq_url: str, queue_name: str) -> None:
     """Consumer thread body. Auto-reconnects with exponential backoff."""
     backoff = 1
+    prefetch_count = _get_positive_int_env("COORDINATOR_REPLY_PREFETCH_COUNT", 10)
     while True:
         try:
             conn = pika.BlockingConnection(pika.URLParameters(rabbitmq_url))
             channel = conn.channel()
             # Declare exclusive auto-delete queue
             channel.queue_declare(queue=queue_name, exclusive=True, auto_delete=True)
-            channel.basic_qos(prefetch_count=10)
+            channel.basic_qos(prefetch_count=prefetch_count)
             channel.basic_consume(queue=queue_name, on_message_callback=_on_reply)
             logger.info("Reply consumer ready on queue=%s", queue_name)
             backoff = 1

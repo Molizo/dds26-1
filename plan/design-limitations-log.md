@@ -774,6 +774,24 @@ Use this log to avoid repeating known mistakes and to justify walking back earli
   - Add the leader lock only if order service is actually scaled.
   - Updated in `plan/phase1-rebuild-plan.md`: recovery model updated.
 
+## 2026-03-06 - Multiple order workers can duplicate recovery for the same tx
+
+- Limitation encountered:
+  - With gunicorn worker processes, each worker can run a recovery scanner and pick the same stale transaction at the same time.
+
+- Why the current design caused it:
+  - Recovery runs inside the order service process model.
+  - The active-tx guard prevents different txs on one order but does not by itself serialize recovery attempts for the same `tx_id`.
+
+- Impact:
+  - **Reliability risk (medium)**: duplicate `resume_transaction` invocations increase race surface and message churn.
+  - **Performance risk (medium)**: repeated publish/wait cycles add avoidable load during failure recovery.
+
+- Chosen mitigation or follow-up action:
+  - Add a best-effort per-tx recovery lock key (`tx_recovery_lock:{tx_id}`) with TTL in Redis.
+  - Recovery scanner acquires this lock before resuming a stale tx and releases it afterward.
+  - Keep all repair logic centralized in `CoordinatorService.resume_transaction(...)`; the lock only serializes who is allowed to invoke it.
+
 ## Update Rules
 
 When adding a new entry:

@@ -10,6 +10,7 @@ Key layout:
   tx_decision:{tx_id}                — "commit" or "abort" (plain string)
   order_active_tx:{order_id}         — tx_id with TTL (plain string)
   order_commit_fence:{order_id}      — tx_id (plain string)
+  tx_recovery_lock:{tx_id}           — best-effort recovery mutex with TTL
   tx_index                           — Redis SET of all tx_ids (for get_non_terminal_txs scan)
 """
 import time
@@ -254,3 +255,26 @@ def refresh_active_tx_guard(
     """Reset the TTL on an existing guard. Returns True if the key existed."""
     result = db.expire(f"order_active_tx:{order_id}", ttl)
     return bool(result)
+
+
+# ---------------------------------------------------------------------------
+# Recovery scan lock (best-effort, per tx_id)
+# ---------------------------------------------------------------------------
+
+def acquire_recovery_lock(
+    db: redis.Redis, tx_id: str, ttl: int = ACTIVE_TX_GUARD_TTL
+) -> bool:
+    """Acquire a short-lived lock so only one worker resumes a tx at a time."""
+    try:
+        result = db.set(f"tx_recovery_lock:{tx_id}", "1", nx=True, ex=ttl)
+        return result is True
+    except redis.exceptions.RedisError as exc:
+        logger.error("Redis error acquiring recovery lock tx=%s: %s", tx_id, exc)
+        return False
+
+
+def release_recovery_lock(db: redis.Redis, tx_id: str) -> None:
+    try:
+        db.delete(f"tx_recovery_lock:{tx_id}")
+    except redis.exceptions.RedisError as exc:
+        logger.error("Redis error releasing recovery lock tx=%s: %s", tx_id, exc)

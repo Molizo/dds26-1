@@ -218,9 +218,27 @@ Use this log to avoid repeating known mistakes and to justify walking back earli
   - Delivery risk: performance claims can be misleading if the metric is not named precisely.
 
 - Chosen mitigation or follow-up action:
+  - Measure committed-checkout throughput separately from raw request throughput.
+  - Prefer benchmark setups that create or rotate fresh orders when the goal is to measure real transaction work.
   - Keep already-paid checkout as `200` because the contract is correct.
   - Explicitly optimize the already-paid fast path for raw request throughput.
   - Track and report headline request throughput separately from committed checkout throughput.
+
+## 2026-03-10 - Local docker-compose gateway was effectively pinned to one order container
+
+- Limitation encountered:
+  - The local compose stack routed `/orders/*` traffic to a single statically named order backend, making it awkward to test multi-container order-service throughput locally.
+
+- Why the current design caused it:
+  - The Nginx upstream in the compose setup declared only one order-service host.
+  - Local compose did not include an additional order-service instance by default.
+
+- Impact:
+  - Performance risk: local throughput experiments could understate order-service capacity.
+  - Delivery risk: changing container count for local benchmarks required manual infrastructure edits instead of a simple stack restart.
+
+- Chosen mitigation or follow-up action:
+  - Add extra order-service containers to the compose stack and include all local order backends in the Nginx upstream for round-robin balancing.
 
 ## 2026-03-02 - Per-item protocol chatter can dominate latency on large orders
 

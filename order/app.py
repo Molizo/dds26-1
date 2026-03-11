@@ -29,6 +29,9 @@ from common.result import CheckoutResult
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
+REQUEST_TIMEOUT_SECONDS = 5.0
+REQUEST_RETRY_COUNT = 3
+ORDER_UPDATE_RETRY_COUNT = 10
 
 # ---------------------------------------------------------------------------
 # Startup validation
@@ -114,18 +117,44 @@ def _get_order_or_abort(order_id: str) -> OrderValue:
     return order
 
 
-def _send_post(url: str) -> requests.Response:
+def _require_positive_int(value: int | str, field_name: str) -> int:
     try:
-        return _session.post(url)
-    except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
+        parsed = int(value)
+    except (TypeError, ValueError):
+        abort(400, f"{field_name} must be a positive integer")
+    if parsed <= 0:
+        abort(400, f"{field_name} must be a positive integer")
+    return parsed
+
+
+def _send_post(url: str) -> requests.Response:
+    for attempt in range(REQUEST_RETRY_COUNT):
+        try:
+            return _session.post(url, timeout=REQUEST_TIMEOUT_SECONDS)
+        except requests.exceptions.RequestException as exc:
+            app.logger.warning(
+                "POST %s attempt %s/%s failed: %s",
+                url,
+                attempt + 1,
+                REQUEST_RETRY_COUNT,
+                exc,
+            )
+    abort(400, REQ_ERROR_STR)
 
 
 def _send_get(url: str) -> requests.Response:
-    try:
-        return _session.get(url)
-    except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
+    for attempt in range(REQUEST_RETRY_COUNT):
+        try:
+            return _session.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+        except requests.exceptions.RequestException as exc:
+            app.logger.warning(
+                "GET %s attempt %s/%s failed: %s",
+                url,
+                attempt + 1,
+                REQUEST_RETRY_COUNT,
+                exc,
+            )
+    abort(400, REQ_ERROR_STR)
 
 
 # ---------------------------------------------------------------------------
@@ -183,22 +212,62 @@ def find_order(order_id: str):
 
 @app.post('/addItem/<order_id>/<item_id>/<quantity>')
 def add_item(order_id: str, item_id: str, quantity: int):
-    order = _get_order_or_abort(order_id)
+    quantity = _require_positive_int(quantity, "quantity")
     # Direct HTTP to stock service — no gateway hairpin
     item_reply = _send_get(f"{STOCK_SERVICE_URL}/find/{item_id}")
     if item_reply.status_code != 200:
         abort(400, f"Item: {item_id} does not exist!")
     item_json: dict = item_reply.json()
-    order.items.append((item_id, int(quantity)))
-    order.total_cost += int(quantity) * item_json["price"]
-    try:
-        db.set(order_id, msgpack.encode(order))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(
-        f"Item: {item_id} added to: {order_id} price updated to: {order.total_cost}",
-        status=200,
-    )
+    price = int(item_json["price"])
+    order_paid_key = f"order_paid:{order_id}"
+    active_tx_key = f"order_active_tx:{order_id}"
+
+    for _ in range(ORDER_UPDATE_RETRY_COUNT):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(order_id, order_paid_key, active_tx_key)
+                raw_order = pipe.get(order_id)
+                if raw_order is None:
+                    pipe.unwatch()
+                    abort(400, f"Order: {order_id} not found!")
+
+                order = msgpack.decode(raw_order, type=OrderValue)
+                if order.paid or pipe.exists(order_paid_key) == 1:
+                    pipe.unwatch()
+                    abort(409, "Order already paid")
+
+                guard_raw = pipe.get(active_tx_key)
+                clear_stale_terminal_guard = False
+                if guard_raw:
+                    guard_tx_id = (
+                        guard_raw.decode()
+                        if isinstance(guard_raw, bytes)
+                        else str(guard_raw)
+                    )
+                    existing_tx = get_tx(db, guard_tx_id)
+                    if existing_tx is None or existing_tx.status not in TERMINAL_STATUSES:
+                        pipe.unwatch()
+                        abort(409, "Checkout already in progress")
+                    clear_stale_terminal_guard = True
+
+                order.items.append((item_id, quantity))
+                order.total_cost += quantity * price
+
+                pipe.multi()
+                if clear_stale_terminal_guard:
+                    pipe.delete(active_tx_key)
+                pipe.set(order_id, msgpack.encode(order))
+                pipe.execute()
+                return Response(
+                    f"Item: {item_id} added to: {order_id} price updated to: {order.total_cost}",
+                    status=200,
+                )
+        except redis.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            return abort(400, DB_ERROR_STR)
+
+    abort(409, "Conflict: could not update order")
 
 
 # ---------------------------------------------------------------------------

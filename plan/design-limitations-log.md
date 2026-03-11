@@ -7,6 +7,23 @@ It should be updated whenever implementation reveals a new constraint, incorrect
 
 Use this log to avoid repeating known mistakes and to justify walking back earlier decisions when needed.
 
+## 2026-03-11 - Live-stack transaction verification needs out-of-band observability
+
+- Limitation encountered:
+  - The public API exposes order domain state, but not coordinator tx state, active guards, or queue-level reply flow. That makes it impossible to prove recovery convergence and terminal cleanup from HTTP responses alone.
+
+- Why the current design caused it:
+  - Coordinator persistence deliberately lives behind internal Redis-backed storage and the external API avoids exposing orchestration internals.
+
+- Impact:
+  - Reliability risk: end-to-end tests can miss leaked non-terminal txs or stale guards if they only look at `200`/`400` route results.
+  - Delivery risk: recovery testing becomes slower and more brittle when it has to infer internal state indirectly.
+
+- Chosen mitigation or follow-up action:
+  - Keep the external API unchanged.
+  - Add test-only live-stack helpers that inspect RabbitMQ via the management API and inspect order-service coordinator state via `docker compose exec`.
+  - Use those helpers for recovery and participant-worker integration tests instead of adding production debug endpoints.
+
 ## 2026-03-11 - Test coverage is strong on coordinator internals but incomplete on system concurrency and end-to-end recovery
 
 - Limitation encountered:

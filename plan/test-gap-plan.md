@@ -21,7 +21,38 @@ The goal is not to add more tests indiscriminately. The goal is to close the spe
 - unit tests for recovery worker behavior
 - failure-mode tests for active-tx guard and stale replies
 
-The remaining gaps are concentrated in places where the current suite does not exercise the real system end-to-end or under concurrency pressure.
+Those gaps were concentrated in places where the suite did not yet exercise the real system end-to-end or under concurrency pressure.
+
+## Implementation Status
+
+Implemented on 2026-03-11:
+
+- `test/test_step4_order_api.py`
+  - concurrent `addItem`
+  - mutation rejection on paid/in-flight orders
+  - same-order checkout storm
+- `test/test_step4_stock_validation.py`
+  - invalid numeric input coverage for stock endpoints
+- `test/test_step4_payment_validation.py`
+  - invalid numeric input coverage for payment endpoints
+- `test/test_step4_order_http_helpers.py`
+  - bounded internal HTTP failure behavior
+- `test/test_step5_participant_workers.py`
+  - real RabbitMQ worker replay/idempotency
+  - malformed-message dead-lettering
+  - `tx_not_found` release/commit no-op semantics
+- `test/test_step5_recovery_convergence.py`
+  - live-stack recovery convergence from `FAILED_NEEDS_RECOVERY` to terminal abort
+  - guard cleanup and clean retry after recovery
+- `test/test_stress_consistency.py`
+  - repeatable stress/consistency harness
+  - included in the default automated test run
+
+Plan status:
+
+- P0 gaps are covered by automated tests.
+- P1 gaps are covered by automated tests.
+- P2 stress coverage exists in the default automated test run.
 
 ## Missing Tests
 
@@ -177,7 +208,11 @@ This plan is complete when:
 - the new tests fail on a real regression instead of only asserting status codes
 - consistency checks validate stock, credit, and final order state together
 - recovery tests prove convergence to a terminal state after an induced failure
-- stress tests are separated from normal CI/unit runs but remain documented and runnable
+- stress tests are documented, runnable, and included in the normal automated run
+
+Current status:
+
+- Complete. The exit criteria above are now satisfied.
 
 ## Notes
 

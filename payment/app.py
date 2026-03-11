@@ -43,6 +43,16 @@ def get_user_from_db(user_id: str) -> UserValue:
     return entry
 
 
+def _require_positive_int(value: int | str, field_name: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        abort(400, f"{field_name} must be a positive integer")
+    if parsed <= 0:
+        abort(400, f"{field_name} must be a positive integer")
+    return parsed
+
+
 @app.post('/create_user')
 def create_user():
     key = str(uuid.uuid4())
@@ -77,7 +87,8 @@ def find_user(user_id: str):
 
 @app.post('/add_funds/<user_id>/<amount>')
 def add_credit(user_id: str, amount: int):
-    result = payment_service.add_credit(db, user_id, int(amount))
+    amount = _require_positive_int(amount, "amount")
+    result = payment_service.add_credit(db, user_id, amount)
     if not result["ok"]:
         error = result.get("error", "unknown")
         if error == "not_found":
@@ -88,8 +99,9 @@ def add_credit(user_id: str, amount: int):
 
 @app.post('/pay/<user_id>/<amount>')
 def remove_credit(user_id: str, amount: int):
+    amount = _require_positive_int(amount, "amount")
     app.logger.debug("Removing %s credit from user: %s", amount, user_id)
-    result = payment_service.pay_credit(db, user_id, int(amount))
+    result = payment_service.pay_credit(db, user_id, amount)
     if not result["ok"]:
         error = result.get("error", "unknown")
         if error == "not_found":

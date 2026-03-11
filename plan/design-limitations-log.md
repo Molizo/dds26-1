@@ -7,6 +7,26 @@ It should be updated whenever implementation reveals a new constraint, incorrect
 
 Use this log to avoid repeating known mistakes and to justify walking back earlier decisions when needed.
 
+## 2026-03-11 - Test coverage is strong on coordinator internals but incomplete on system concurrency and end-to-end recovery
+
+- Limitation encountered:
+  - The current suite covers coordinator protocol transitions and recovery logic well, but it does not explicitly test concurrent `addItem`, invalid numeric inputs, real participant replay/idempotency at the queue level, same-order checkout storms, or full recovery convergence in a live stack.
+
+- Why the current design caused it:
+  - Test design focused first on coordinator extraction and protocol safety.
+  - This left external concurrency behavior and participant-level integration largely covered only indirectly.
+  - The suite optimized for deterministic unit tests before adding targeted end-to-end concurrency checks.
+
+- Impact:
+  - Correctness risk: lost updates on order mutation can slip through.
+  - Reliability risk: recovery may be correct in unit tests but insufficiently proven in the deployed stack.
+  - Delivery risk: the project can appear well tested while still missing the highest-risk system behaviors.
+
+- Chosen mitigation or follow-up action:
+  - Track the missing cases in `plan/test-gap-plan.md`.
+  - Prioritize tests for concurrent `addItem`, invalid numeric inputs, order mutation after checkout, and same-order checkout contention.
+  - Add participant-worker integration tests and a real recovery convergence test before expanding load/stress coverage.
+
 ## 2026-03-02 - Earlier attempt solved the wrong phase first
 
 - Limitation encountered:

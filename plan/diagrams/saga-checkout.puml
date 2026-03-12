@@ -1,0 +1,262 @@
+@startuml
+title SAGA Checkout - Combined View
+hide footbox
+
+participant Client
+participant "Order service" as Order
+participant Coordinator
+participant "Stock service" as Stock
+participant "Payment service" as Payment
+participant "Recovery worker" as Recovery
+
+legend right
+|<#2E8B57>| normal progress |
+|<#B22222>| failure branch |
+|<#D97706>| recovery or undo |
+endlegend
+
+note over Client,Recovery #FFF8DC
+Recovery may finish the transaction after the original
+client request has already timed out.
+end note
+
+Client -[#2E8B57]> Order : Ask to check out the order.
+
+alt The order does not exist
+  Order -[#B22222]> Client : Reject the request.
+  note over Client,Order #FDEDEC
+  End: request rejected.
+  end note
+
+else Another checkout already holds the guard
+  Order -[#B22222]> Client : Reject the request because checkout is already in progress.
+  note over Client,Order #FDEDEC
+  End: request rejected.
+  end note
+
+else The order is already paid
+  Order -[#2E8B57]> Client : Return success immediately.
+  note over Client,Order #E8F8F5
+  End: already paid success.
+  end note
+
+else The order is valid and no other checkout is running
+  Order -[#2E8B57]> Order : Validate the order and acquire the checkout guard.
+  Order -[#2E8B57]> Coordinator : Start the coordinator transaction.
+
+  group HOLD stage
+    par Stock HOLD branch
+      Coordinator -[#2E8B57]> Stock : Try to reserve the items for HOLD.
+    else Payment HOLD branch
+      Coordinator -[#2E8B57]> Payment : Try to reserve the money for HOLD.
+    end
+
+    alt Both HOLD replies say ok
+      Stock -[#2E8B57]> Coordinator : HOLD ok.
+      Payment -[#2E8B57]> Coordinator : HOLD ok.
+      Coordinator -[#2E8B57]> Order : Mark the order as paid.
+
+      alt The order write succeeds
+        Order -[#2E8B57]> Coordinator : The order is now paid.
+        Coordinator -[#2E8B57]> Coordinator : Record COMMIT.
+
+        group COMMIT stage
+          par Stock COMMIT branch
+            Coordinator -[#2E8B57]> Stock : Finish COMMIT for the reservation.
+          else Payment COMMIT branch
+            Coordinator -[#2E8B57]> Payment : Finish COMMIT for the money hold.
+          end
+
+          alt Both COMMIT confirmations arrive
+            Stock -[#2E8B57]> Coordinator : COMMIT confirmed.
+            Payment -[#2E8B57]> Coordinator : COMMIT confirmed.
+            Coordinator -[#2E8B57]> Order : Clear the checkout guard.
+            Order -[#2E8B57]> Client : Return success.
+            note over Client,Order #E8F8F5
+            End: success.
+            end note
+
+          else A COMMIT confirmation is missing,\na COMMIT publish fails,\na participant returns an error,\na wrong-phase reply is ignored,\nor the coordinator stops after the order is paid
+            Coordinator -[#B22222]> Coordinator : The transaction needs recovery after the paid boundary.
+            note over Coordinator,Payment #FDEDEC
+            This branch covers:
+            - stock COMMIT confirmation lost
+            - payment COMMIT confirmation lost
+            - COMMIT publish failure
+            - participant error during COMMIT
+            - stale HOLD reply ignored while waiting for COMMIT
+            - coordinator crash after the order was paid
+              but before the transaction was safely closed
+            end note
+
+            Recovery -[#D97706]> Coordinator : Inspect the state and move forward.
+            Recovery -[#D97706]> Coordinator : Because the order is already paid,\nfinish COMMIT instead of undoing work.
+
+            par Finish stock COMMIT
+              Coordinator -[#D97706]> Stock : Retry or confirm COMMIT for the reservation.
+              Stock -[#D97706]> Coordinator : COMMIT confirmed.
+            else Finish payment COMMIT
+              Coordinator -[#D97706]> Payment : Retry or confirm COMMIT for the money hold.
+              Payment -[#D97706]> Coordinator : COMMIT confirmed.
+            end
+
+            Coordinator -[#D97706]> Order : Clear the checkout guard if it is still set.
+            note over Order,Recovery #E8F8F5
+            End: success after recovery.
+            end note
+          end
+        end
+
+      else The order write fails,\nor the coordinator stops before the paid boundary is safely resolved
+        Coordinator -[#B22222]> Coordinator : Start RELEASE and REFUND now.
+        note over Coordinator,Recovery #FDEDEC
+        This branch covers:
+        - the order database write failed
+        - coordinator crash after both HOLD replies
+          but before the paid boundary was safely resolved
+        end note
+
+        group Undo stage
+          par Undo stock HOLD
+            Coordinator -[#D97706]> Stock : RELEASE the reservation.
+          else Undo payment HOLD
+            Coordinator -[#D97706]> Payment : REFUND or RELEASE the money hold.
+          end
+
+          alt Both undo confirmations arrive
+            Stock -[#D97706]> Coordinator : RELEASE confirmed.
+            Payment -[#D97706]> Coordinator : REFUND or RELEASE confirmed.
+            Coordinator -[#D97706]> Order : Clear the checkout guard if it is still set.
+            note over Order,Recovery #FCF3CF
+            End: checkout aborted.
+            end note
+
+          else A RELEASE or REFUND confirmation is missing,\na RELEASE publish fails,\na participant returns an error,\na wrong-phase reply is ignored,\nor the coordinator stops during undo
+            Coordinator -[#B22222]> Coordinator : The transaction now needs recovery.
+            note over Coordinator,Payment #FDEDEC
+            This branch covers:
+            - stock RELEASE confirmation lost
+            - payment REFUND confirmation lost
+            - RELEASE or REFUND publish failure
+            - participant error during RELEASE or REFUND
+            - stale HOLD reply ignored while waiting for RELEASE
+            - coordinator crash during undo
+            end note
+
+            Recovery -[#D97706]> Coordinator : Inspect what already happened.
+
+            alt The order is already paid
+              Recovery -[#D97706]> Coordinator : Move forward and finish COMMIT.
+
+              par Finish stock COMMIT
+                Coordinator -[#D97706]> Stock : Retry or confirm COMMIT for the reservation.
+                Stock -[#D97706]> Coordinator : COMMIT confirmed.
+              else Finish payment COMMIT
+                Coordinator -[#D97706]> Payment : Retry or confirm COMMIT for the money hold.
+                Payment -[#D97706]> Coordinator : COMMIT confirmed.
+              end
+
+              Coordinator -[#D97706]> Order : Clear the checkout guard if it is still set.
+              note over Order,Recovery #E8F8F5
+              End: success after recovery.
+              end note
+
+            else The order is not safely paid
+              Recovery -[#D97706]> Coordinator : Continue RELEASE and REFUND.
+
+              par Continue stock undo
+                Coordinator -[#D97706]> Stock : RELEASE the reservation.
+                Stock -[#D97706]> Coordinator : RELEASE confirmed.
+              else Continue payment undo
+                Coordinator -[#D97706]> Payment : REFUND or RELEASE the money hold.
+                Payment -[#D97706]> Coordinator : REFUND or RELEASE confirmed.
+              end
+
+              Coordinator -[#D97706]> Order : Clear the checkout guard if it is still set.
+              note over Order,Recovery #FCF3CF
+              End: checkout aborted after recovery.
+              end note
+            end
+          end
+        end
+      end
+
+    else HOLD does not finish cleanly,\nor the coordinator stops during HOLD
+      Coordinator -[#B22222]> Coordinator : Record ABORT and start RELEASE and REFUND now.
+      note over Coordinator,Payment #FDEDEC
+      This branch covers:
+      - stock reject
+      - payment reject
+      - timeout or lost reply
+      - HOLD publish failure
+      - coordinator crash before both HOLD replies
+        were safely handled
+      end note
+
+      group Undo stage
+        par Undo stock HOLD
+          Coordinator -[#D97706]> Stock : RELEASE the reservation.
+        else Undo payment HOLD
+          Coordinator -[#D97706]> Payment : REFUND or RELEASE the money hold.
+        end
+
+        alt Both undo confirmations arrive
+          Stock -[#D97706]> Coordinator : RELEASE confirmed.
+          Payment -[#D97706]> Coordinator : REFUND or RELEASE confirmed.
+          Coordinator -[#D97706]> Order : Clear the checkout guard if it is still set.
+          note over Order,Recovery #FCF3CF
+          End: checkout aborted.
+          end note
+
+        else A RELEASE or REFUND confirmation is missing,\na RELEASE publish fails,\na participant returns an error,\na wrong-phase reply is ignored,\nor the coordinator stops during undo
+          Coordinator -[#B22222]> Coordinator : The transaction now needs recovery.
+          note over Coordinator,Payment #FDEDEC
+          This branch covers:
+          - stock RELEASE confirmation lost
+          - payment REFUND confirmation lost
+          - RELEASE or REFUND publish failure
+          - participant error during RELEASE or REFUND
+          - stale HOLD reply ignored while waiting for RELEASE
+          - coordinator crash during undo
+          end note
+
+          Recovery -[#D97706]> Coordinator : Inspect what already happened.
+
+          alt The order is already paid
+            Recovery -[#D97706]> Coordinator : Move forward and finish COMMIT.
+
+            par Finish stock COMMIT
+              Coordinator -[#D97706]> Stock : Retry or confirm COMMIT for the reservation.
+              Stock -[#D97706]> Coordinator : COMMIT confirmed.
+            else Finish payment COMMIT
+              Coordinator -[#D97706]> Payment : Retry or confirm COMMIT for the money hold.
+              Payment -[#D97706]> Coordinator : COMMIT confirmed.
+            end
+
+            Coordinator -[#D97706]> Order : Clear the checkout guard if it is still set.
+            note over Order,Recovery #E8F8F5
+            End: success after recovery.
+            end note
+
+          else The order is not safely paid
+            Recovery -[#D97706]> Coordinator : Continue RELEASE and REFUND.
+
+            par Continue stock undo
+              Coordinator -[#D97706]> Stock : RELEASE the reservation.
+              Stock -[#D97706]> Coordinator : RELEASE confirmed.
+            else Continue payment undo
+              Coordinator -[#D97706]> Payment : REFUND or RELEASE the money hold.
+              Payment -[#D97706]> Coordinator : REFUND or RELEASE confirmed.
+            end
+
+            Coordinator -[#D97706]> Order : Clear the checkout guard if it is still set.
+            note over Order,Recovery #FCF3CF
+            End: checkout aborted after recovery.
+            end note
+          end
+        end
+      end
+    end
+  end
+end
+@enduml

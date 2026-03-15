@@ -1,0 +1,33 @@
+global:
+  security:
+    allowInsecureImages: true
+
+image:
+  registry: docker.io
+  repository: bitnamilegacy/rabbitmq
+
+volumePermissions:
+  image:
+    registry: docker.io
+    repository: bitnamilegacy/os-shell
+
+auth:
+  username: guest
+  password: guest
+
+replicaCount: 7
+
+clustering:
+  enabled: true
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+
+persistence:
+  enabled: true
+  size: 8Gi

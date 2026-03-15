@@ -5,13 +5,25 @@ master:
     size: 4Gi
   resources:
     requests:
-      memory: 4Gi
-      cpu: 2
+      memory: 512Mi
+      cpu: 250m
+    limits:
+      memory: 2Gi
+      cpu: 1000m
 replica:
   replicaCount: 1
   persistence:
     size: 4Gi
   resources:
     requests:
-      memory: 4Gi
-      cpu: 2
+      memory: 512Mi
+      cpu: 250m
+    limits:
+      memory: 2Gi
+      cpu: 1000m
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 4
+    targetCPU: "70"
+    targetMemory: "80"

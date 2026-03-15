@@ -1,0 +1,122 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-db
+spec:
+  type: ClusterIP
+  selector:
+    app: order-db
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-db-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-db
+  template:
+    metadata:
+      labels:
+        app: order-db
+    spec:
+      containers:
+        - name: order-db
+          image: redis:7.2-bookworm
+          imagePullPolicy: IfNotPresent
+          command: ["redis-server", "--requirepass", "redis", "--maxmemory", "2gb", "--maxmemory-policy", "allkeys-lru", "--save", "", "--appendonly", "no", "--io-threads", "4", "--io-threads-do-reads", "yes"]
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: "1500m"
+              memory: "1Gi"
+            limits:
+              cpu: "4000m"
+              memory: "4Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stock-db
+spec:
+  type: ClusterIP
+  selector:
+    app: stock-db
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stock-db-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stock-db
+  template:
+    metadata:
+      labels:
+        app: stock-db
+    spec:
+      containers:
+        - name: stock-db
+          image: redis:7.2-bookworm
+          imagePullPolicy: IfNotPresent
+          command: ["redis-server", "--requirepass", "redis", "--maxmemory", "768mb", "--maxmemory-policy", "allkeys-lru"]
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-db
+spec:
+  type: ClusterIP
+  selector:
+    app: payment-db
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-db-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payment-db
+  template:
+    metadata:
+      labels:
+        app: payment-db
+    spec:
+      containers:
+        - name: payment-db
+          image: redis:7.2-bookworm
+          imagePullPolicy: IfNotPresent
+          command: ["redis-server", "--requirepass", "redis", "--maxmemory", "768mb", "--maxmemory-policy", "allkeys-lru"]
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"

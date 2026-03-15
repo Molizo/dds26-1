@@ -5,7 +5,7 @@ metadata:
 spec:
   type: ClusterIP
   selector:
-    component: stock
+    app: stock-service
   ports:
     - port: 5000
       name: http
@@ -19,31 +19,39 @@ spec:
   replicas: 1
   selector:
     matchLabels:
-      component: stock
+      app: stock-service
   template:
     metadata:
       labels:
-        component: stock
+        app: stock-service
     spec:
       containers:
         - name: stock
           image: ttl.sh/dds26-1-stock:24h
+          imagePullPolicy: IfNotPresent
+          command: ["gunicorn", "-b", "0.0.0.0:5000", "-w", "8", "-c", "gunicorn.conf.py", "--timeout", "30", "--log-level=info", "app:app"]
           resources:
-            limits:
-              memory: "1Gi"
-              cpu: "1"
             requests:
+              cpu: "300m"
+              memory: "256Mi"
+            limits:
+              cpu: "800m"
               memory: "1Gi"
-              cpu: "1"
-          command: ["gunicorn"]
-          args: ["-b", "0.0.0.0:5000", "app:app"]
           ports:
             - containerPort: 5000
           env:
+            - name: ORDER_SERVICE_URL
+              value: "http://order-service:5000"
+            - name: RABBITMQ_URL
+              value: "amqp://guest:guest@rabbitmq:5672/"
+            - name: PARTICIPANT_CONSUMER_PREFETCH_COUNT
+              value: "8"
+            - name: CHECKOUT_PROTOCOL
+              value: "saga"
             - name: REDIS_HOST
-              value: redis-master
+              value: "stock-db"
             - name: REDIS_PORT
-              value: '6379'
+              value: "6379"
             - name: REDIS_PASSWORD
               value: "redis"
             - name: REDIS_DB

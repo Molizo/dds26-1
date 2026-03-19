@@ -51,8 +51,13 @@ def _get_acquire_active_tx_guard_script(db: redis.Redis) -> Script:
             local mutation_key = KEYS[2]
             local tx_id = ARGV[1]
             local ttl = tonumber(ARGV[2])
+            local current = redis.call('GET', active_key)
 
-            if redis.call('EXISTS', active_key) == 1 then
+            if current then
+                if current == tx_id then
+                    redis.call('EXPIRE', active_key, ttl)
+                    return 1
+                end
                 return 0
             end
             if redis.call('EXISTS', mutation_key) == 1 then
@@ -75,11 +80,16 @@ def _get_acquire_mutation_guard_script(db: redis.Redis) -> Script:
             local active_key = KEYS[2]
             local lease_id = ARGV[1]
             local ttl = tonumber(ARGV[2])
+            local current = redis.call('GET', mutation_key)
 
             if redis.call('EXISTS', active_key) == 1 then
                 return 0
             end
-            if redis.call('EXISTS', mutation_key) == 1 then
+            if current then
+                if current == lease_id then
+                    redis.call('EXPIRE', mutation_key, ttl)
+                    return 1
+                end
                 return 0
             end
 
@@ -260,6 +270,12 @@ def get_active_tx_guard(db: redis.Redis, order_id: str) -> Optional[str]:
 
 def clear_active_tx_guard(db: redis.Redis, order_id: str) -> None:
     db.delete(_active_tx_key(order_id))
+
+
+def clear_active_tx_guard_if_owned(db: redis.Redis, order_id: str, tx_id: str) -> bool:
+    script = _get_release_owned_key_script(db)
+    result = script(keys=[_active_tx_key(order_id)], args=[tx_id])
+    return int(result) == 1
 
 
 def refresh_active_tx_guard(

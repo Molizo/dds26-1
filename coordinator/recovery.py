@@ -187,8 +187,7 @@ class RecoveryWorker:
 
     def _clear_guard_if_owned(self, order_id: str, tx_id: str) -> None:
         try:
-            if self._tx.get_active_tx_guard(order_id) == tx_id:
-                self._tx.clear_active_tx_guard(order_id)
+            self._tx.clear_active_tx_guard_if_owned(order_id, tx_id)
         except Exception:
             logger.exception(
                 "Failed clearing active tx guard order=%s tx=%s",

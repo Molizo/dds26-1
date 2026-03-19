@@ -24,9 +24,8 @@ def _load_module(module_name: str, file_path: str):
 
 
 def load_order_app():
-    os.environ.setdefault("CHECKOUT_PROTOCOL", "saga")
     os.environ.setdefault("STOCK_SERVICE_URL", "http://stock-service")
-    os.environ.setdefault("ORCHESTRATOR_SERVICE_URL", "http://orchestrator-service")
+    os.environ.setdefault("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
     os.environ.setdefault("REDIS_HOST", "localhost")
     os.environ.setdefault("REDIS_PORT", "6379")
     os.environ.setdefault("REDIS_PASSWORD", "")

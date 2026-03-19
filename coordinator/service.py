@@ -34,7 +34,7 @@ from coordinator.models import CheckoutTxValue, make_tx
 from coordinator.messaging import (
     get_reply_queue, register_pending, wait_for_replies, cancel_pending,
 )
-from coordinator.ports import OrderPort, TxStorePort, OrderSnapshot
+from coordinator.ports import OrderPort, OrderPortUnavailable, TxStorePort
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,10 @@ class CoordinatorService:
         - acquiring the active-tx guard
         - clearing the guard on terminal result
         """
-        snapshot = self._orders.read_order(order_id)
+        try:
+            snapshot = self._orders.read_order(order_id)
+        except OrderPortUnavailable:
+            return CheckoutResult.fail("order_read_failed")
         if snapshot is None:
             return CheckoutResult.fail("Order not found", code=400)
 
@@ -139,7 +142,14 @@ class CoordinatorService:
     def _saga_commit(self, tx: CheckoutTxValue) -> CheckoutResult:
         """SAGA commit: mark order paid, then send commit commands."""
         # Mark order paid (idempotent) before entering COMMITTING
-        if not self._orders.mark_paid(tx.order_id, tx.tx_id):
+        try:
+            marked_paid = self._orders.mark_paid(tx.order_id, tx.tx_id)
+        except OrderPortUnavailable:
+            tx.status = STATUS_FAILED_NEEDS_RECOVERY
+            tx.last_error = "mark_paid_indeterminate"
+            self._tx.update_tx(tx)
+            return CheckoutResult.fail("mark_paid_indeterminate")
+        if not marked_paid:
             tx.last_error = "mark_paid_failed"
             return self._saga_compensate(tx)
 
@@ -171,13 +181,26 @@ class CoordinatorService:
         tx.retry_count += 1
 
         # Check if order is already paid (crash after mark_paid but before COMMITTING)
-        snapshot = self._orders.read_order(tx.order_id)
+        try:
+            snapshot = self._orders.read_order(tx.order_id)
+        except OrderPortUnavailable:
+            tx.status = STATUS_FAILED_NEEDS_RECOVERY
+            tx.last_error = "order_read_failed"
+            self._tx.update_tx(tx)
+            return CheckoutResult.fail("order_read_failed")
         order_paid = snapshot.paid if snapshot else False
 
         if tx.status == STATUS_COMMITTING or order_paid:
             # Forward recovery: order is paid, just need to finalize commits
             if not order_paid:
-                if not self._orders.mark_paid(tx.order_id, tx.tx_id):
+                try:
+                    marked_paid = self._orders.mark_paid(tx.order_id, tx.tx_id)
+                except OrderPortUnavailable:
+                    tx.status = STATUS_FAILED_NEEDS_RECOVERY
+                    tx.last_error = "mark_paid_indeterminate"
+                    self._tx.update_tx(tx)
+                    return CheckoutResult.fail("mark_paid_indeterminate")
+                if not marked_paid:
                     tx.status = STATUS_FAILED_NEEDS_RECOVERY
                     tx.last_error = "mark_paid_failed"
                     self._tx.update_tx(tx)
@@ -255,7 +278,14 @@ class CoordinatorService:
             return CheckoutResult.fail("commit_confirmation_incomplete")
 
         # Commits confirmed — now mark order paid, then finalize.
-        if not self._orders.mark_paid(tx.order_id, tx.tx_id):
+        try:
+            marked_paid = self._orders.mark_paid(tx.order_id, tx.tx_id)
+        except OrderPortUnavailable:
+            tx.status = STATUS_FAILED_NEEDS_RECOVERY
+            tx.last_error = "mark_paid_indeterminate"
+            self._tx.update_tx(tx)
+            return CheckoutResult.fail("mark_paid_indeterminate")
+        if not marked_paid:
             tx.status = STATUS_FAILED_NEEDS_RECOVERY
             tx.last_error = "mark_paid_failed"
             self._tx.update_tx(tx)
@@ -285,7 +315,13 @@ class CoordinatorService:
             decision = "commit"
 
         # Check if order already paid
-        snapshot = self._orders.read_order(tx.order_id)
+        try:
+            snapshot = self._orders.read_order(tx.order_id)
+        except OrderPortUnavailable:
+            tx.status = STATUS_FAILED_NEEDS_RECOVERY
+            tx.last_error = "order_read_failed"
+            self._tx.update_tx(tx)
+            return CheckoutResult.fail("order_read_failed")
         order_paid = snapshot.paid if snapshot else False
         if order_paid:
             decision = "commit"
@@ -298,7 +334,14 @@ class CoordinatorService:
                 return CheckoutResult.fail("commit_confirmation_incomplete")
             # Commits confirmed — mark paid (idempotent) then finalize
             if not order_paid:
-                if not self._orders.mark_paid(tx.order_id, tx.tx_id):
+                try:
+                    marked_paid = self._orders.mark_paid(tx.order_id, tx.tx_id)
+                except OrderPortUnavailable:
+                    tx.status = STATUS_FAILED_NEEDS_RECOVERY
+                    tx.last_error = "mark_paid_indeterminate"
+                    self._tx.update_tx(tx)
+                    return CheckoutResult.fail("mark_paid_indeterminate")
+                if not marked_paid:
                     tx.status = STATUS_FAILED_NEEDS_RECOVERY
                     tx.last_error = "mark_paid_failed"
                     self._tx.update_tx(tx)
@@ -311,25 +354,13 @@ class CoordinatorService:
 
         return self._2pc_abort(tx)
 
-    # ------------------------------------------------------------------
-    # Tx persistence compatibility helpers
-    # ------------------------------------------------------------------
-
     def _persist_decision_and_update_tx(
         self,
         tx_id: str,
         decision: str,
         tx: CheckoutTxValue,
     ) -> None:
-        """Use combined decision+update call when available, else fallback."""
-        combined = getattr(self._tx, "set_decision_and_update_tx", None)
-        if callable(combined):
-            combined(tx_id, decision, tx)
-            return
-
-        # Backward-compatible sequence for older TxStore implementations.
-        self._tx.set_decision(tx_id, decision)
-        self._tx.update_tx(tx)
+        self._tx.set_decision_and_update_tx(tx_id, decision, tx)
 
     def _persist_decision_fence_and_update_tx(
         self,
@@ -338,16 +369,7 @@ class CoordinatorService:
         order_id: str,
         tx: CheckoutTxValue,
     ) -> None:
-        """Use combined decision+fence+update call when available, else fallback."""
-        combined = getattr(self._tx, "set_decision_fence_and_update_tx", None)
-        if callable(combined):
-            combined(tx_id, decision, order_id, tx)
-            return
-
-        # Backward-compatible sequence for older TxStore implementations.
-        self._tx.set_decision(tx_id, decision)
-        self._tx.set_commit_fence(order_id, tx_id)
-        self._tx.update_tx(tx)
+        self._tx.set_decision_fence_and_update_tx(tx_id, decision, order_id, tx)
 
     # ------------------------------------------------------------------
     # Shared mechanics: publish and wait

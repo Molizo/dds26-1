@@ -7,6 +7,7 @@ from unittest import mock
 import redis
 from msgspec import msgpack
 
+from common.models import InternalReply
 from local_app_loader import load_order_app
 
 
@@ -210,7 +211,11 @@ class TestOrderApiGuards(unittest.TestCase):
                  "_send_get",
                  return_value=_FakeResponse(200, {"price": 5}),
              ), \
-             mock.patch.object(self.order_app, "_acquire_mutation_guard", return_value="lease"), \
+             mock.patch.object(
+                 self.order_app,
+                 "_acquire_mutation_guard",
+                 side_effect=AssertionError("should not acquire guard"),
+             ), \
              mock.patch.object(self.order_app, "_release_mutation_guard"):
             with self.order_app.app.test_client() as client:
                 response = client.post(f"/addItem/{order_id}/item-1/1")
@@ -219,6 +224,26 @@ class TestOrderApiGuards(unittest.TestCase):
         saved = msgpack.decode(fake_db.get(order_id), type=self.store_module.OrderValue)
         self.assertEqual(saved.items, [("item-1", 1)])
         self.assertEqual(saved.total_cost, 5)
+
+    def test_add_item_rejects_missing_order_before_guard_rpc(self):
+        fake_db = _FakeWatchRedis()
+
+        with mock.patch.object(self.order_app, "db", fake_db), \
+             mock.patch.object(
+                 self.order_app,
+                 "_send_get",
+                 return_value=_FakeResponse(200, {"price": 5}),
+             ), \
+             mock.patch.object(
+                 self.order_app,
+                 "_acquire_mutation_guard",
+                 side_effect=AssertionError("should not acquire guard"),
+             ), \
+             mock.patch.object(self.order_app, "_release_mutation_guard"):
+            with self.order_app.app.test_client() as client:
+                response = client.post("/addItem/order-missing/item-1/1")
+
+        self.assertEqual(response.status_code, 400)
 
     def test_add_item_rejects_order_with_active_checkout_guard(self):
         fake_db = _FakeWatchRedis()
@@ -250,12 +275,23 @@ class TestOrderApiGuards(unittest.TestCase):
         state_lock = threading.Lock()
         state = {"winner_assigned": False}
 
-        def _fake_checkout_post(_url, **kwargs):
+        def _fake_checkout_call(_command, _order_id, **kwargs):
             with state_lock:
                 if not state["winner_assigned"]:
                     state["winner_assigned"] = True
-                    return _FakeResponse(200, content=b"Checkout successful")
-            return _FakeResponse(409, content=b"Checkout already in progress")
+                    return InternalReply(
+                        request_id="req-1",
+                        command="checkout",
+                        ok=True,
+                        status_code=200,
+                    )
+            return InternalReply(
+                request_id="req-2",
+                command="checkout",
+                ok=False,
+                status_code=409,
+                error="Checkout already in progress",
+            )
 
         def _run_checkout():
             start_barrier.wait(timeout=2)
@@ -263,7 +299,7 @@ class TestOrderApiGuards(unittest.TestCase):
                 response = client.post("/checkout/order-1")
                 statuses.append(response.status_code)
 
-        with mock.patch.object(self.order_app, "_send_post", side_effect=_fake_checkout_post):
+        with mock.patch.object(self.order_app, "_call_orchestrator", side_effect=_fake_checkout_call):
             threads = [threading.Thread(target=_run_checkout) for _ in range(8)]
             for thread in threads:
                 thread.start()

@@ -7,6 +7,28 @@ It should be updated whenever implementation reveals a new constraint, incorrect
 
 Use this log to avoid repeating known mistakes and to justify walking back earlier decisions when needed.
 
+## 2026-03-19 - Extracting the orchestrator over internal HTTP preserved worker deadlocks and ambiguous side effects
+
+- Limitation encountered:
+  - Keeping public checkout in `order-service` while forwarding to the orchestrator over synchronous HTTP left each checkout request holding an order-service worker while the orchestrator called back into the same service to read orders and mark them paid.
+  - Retrying those non-idempotent HTTP calls on transport errors also made lost responses indistinguishable from failed side effects.
+
+- Why the current design caused it:
+  - The first extraction kept the Phase 1 coordination flow shape and only moved the coordinator process boundary.
+  - That preserved a request/response dependency cycle between `order-service` and `orchestrator` instead of making their internal coordination asynchronous and message-correlated.
+
+- Impact:
+  - Availability risk: checkout concurrency could saturate order-service workers and deadlock orchestrator callbacks.
+  - Consistency risk: a lost `mark_paid` or mutation-guard HTTP response could trigger false aborts, leaked guards, or other indeterminate outcomes.
+  - Delivery risk: docker-compose and Kubernetes configs drifted because the new internal HTTP dependencies were only partially wired.
+
+- Chosen mitigation or follow-up action:
+  - Keep the public API unchanged: `POST /orders/checkout/{order_id}` still enters `order-service`.
+  - Move all internal `order-service` <-> `orchestrator` coordination to RabbitMQ request/reply.
+  - Remove the internal HTTP `read_order`, `mark_paid`, and mutation-guard routes entirely.
+  - Keep only orchestrator-owned Redis guards, and make guard acquire/clear owner-safe and idempotent for same-owner retries.
+  - Provision RabbitMQ, orchestrator, and orchestrator Redis explicitly in both compose and Kubernetes while keeping the orchestrator internal-only.
+
 ## 2026-03-19 - A read-only orchestrator lock check is not enough to serialize order mutation against checkout
 
 - Limitation encountered:

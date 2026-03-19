@@ -40,14 +40,10 @@ spec:
           ports:
             - containerPort: 5000
           env:
-            - name: ORDER_SERVICE_URL
-              value: "http://order-service:5000"
             - name: RABBITMQ_URL
               value: "amqp://guest:guest@rabbitmq:5672/"
             - name: PARTICIPANT_CONSUMER_PREFETCH_COUNT
               value: "8"
-            - name: CHECKOUT_PROTOCOL
-              value: "saga"
             - name: REDIS_HOST
               value: "payment-db"
             - name: REDIS_PORT

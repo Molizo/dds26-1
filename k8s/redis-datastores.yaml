@@ -120,3 +120,44 @@ spec:
             limits:
               cpu: "1000m"
               memory: "1Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator-db
+spec:
+  type: ClusterIP
+  selector:
+    app: orchestrator-db
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator-db-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orchestrator-db
+  template:
+    metadata:
+      labels:
+        app: orchestrator-db
+    spec:
+      containers:
+        - name: orchestrator-db
+          image: redis:7.2-bookworm
+          imagePullPolicy: IfNotPresent
+          command: ["redis-server", "--requirepass", "redis", "--maxmemory", "768mb", "--maxmemory-policy", "allkeys-lru"]
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"

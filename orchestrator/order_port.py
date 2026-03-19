@@ -1,49 +1,81 @@
-"""HTTP-backed OrderPort for the standalone orchestrator."""
+"""RabbitMQ-backed OrderPort for the standalone orchestrator."""
+import uuid
 from typing import Optional
 
-import requests
+from common.constants import ORDER_CMD_MARK_PAID, ORDER_CMD_READ_ORDER, ORDER_COMMANDS_QUEUE
+from common.models import (
+    InternalCommand,
+    decode_internal_reply,
+    encode_internal_command,
+)
+from common.rpc import rpc_request_bytes
+from coordinator.ports import OrderPortUnavailable, OrderSnapshot
 
-from coordinator.ports import OrderSnapshot
 
-
-class HttpOrderPort:
+class RabbitMqOrderPort:
     def __init__(
         self,
-        order_service_url: str,
-        session: requests.Session,
+        rabbitmq_url: str,
         timeout_seconds: float = 5.0,
     ):
-        self._order_service_url = order_service_url.rstrip("/")
-        self._session = session
+        self._rabbitmq_url = rabbitmq_url
         self._timeout_seconds = timeout_seconds
 
     def read_order(self, order_id: str) -> Optional[OrderSnapshot]:
-        try:
-            response = self._session.get(
-                f"{self._order_service_url}/internal/orders/{order_id}",
-                timeout=self._timeout_seconds,
-            )
-        except requests.exceptions.RequestException:
-            return None
-        if response.status_code != 200:
-            return None
+        request_id = str(uuid.uuid4())
+        response = rpc_request_bytes(
+            self._rabbitmq_url,
+            ORDER_COMMANDS_QUEUE,
+            request_id=request_id,
+            body=encode_internal_command(
+                InternalCommand(
+                    request_id=request_id,
+                    command=ORDER_CMD_READ_ORDER,
+                    order_id=order_id,
+                )
+            ),
+            timeout_seconds=self._timeout_seconds,
+        )
+        if response is None:
+            raise OrderPortUnavailable("order_read_timeout")
 
-        payload = response.json()
+        reply = decode_internal_reply(response)
+        if not reply.ok or reply.snapshot is None:
+            if reply.error == "not_found":
+                return None
+            raise OrderPortUnavailable(reply.error or "order_read_failed")
+
+        snapshot = reply.snapshot
         return OrderSnapshot(
-            order_id=payload["order_id"],
-            user_id=payload["user_id"],
-            total_cost=int(payload["total_cost"]),
-            paid=bool(payload["paid"]),
-            items=[(item_id, int(quantity)) for item_id, quantity in payload["items"]],
+            order_id=snapshot.order_id,
+            user_id=snapshot.user_id,
+            total_cost=int(snapshot.total_cost),
+            paid=bool(snapshot.paid),
+            items=[(item_id, int(quantity)) for item_id, quantity in snapshot.items],
         )
 
     def mark_paid(self, order_id: str, tx_id: str) -> bool:
-        try:
-            response = self._session.post(
-                f"{self._order_service_url}/internal/orders/{order_id}/mark_paid",
-                json={"tx_id": tx_id},
-                timeout=self._timeout_seconds,
-            )
-        except requests.exceptions.RequestException:
-            return False
-        return response.status_code == 200
+        request_id = str(uuid.uuid4())
+        response = rpc_request_bytes(
+            self._rabbitmq_url,
+            ORDER_COMMANDS_QUEUE,
+            request_id=request_id,
+            body=encode_internal_command(
+                InternalCommand(
+                    request_id=request_id,
+                    command=ORDER_CMD_MARK_PAID,
+                    order_id=order_id,
+                    tx_id=tx_id,
+                )
+            ),
+            timeout_seconds=self._timeout_seconds,
+        )
+        if response is None:
+            raise OrderPortUnavailable("mark_paid_timeout")
+
+        reply = decode_internal_reply(response)
+        if not reply.ok:
+            if reply.error == "not_found":
+                return False
+            raise OrderPortUnavailable(reply.error or "mark_paid_failed")
+        return True

@@ -24,7 +24,7 @@ from common.constants import (
 from common.models import ParticipantReply
 from common.result import CheckoutResult
 from coordinator.models import CheckoutTxValue, make_tx
-from coordinator.ports import OrderSnapshot
+from coordinator.ports import OrderPortUnavailable, OrderSnapshot
 from coordinator.service import CoordinatorService, _aggregate_items
 
 
@@ -86,11 +86,20 @@ class _MockTxStore:
     def set_decision(self, tx_id, decision):
         self.decisions[tx_id] = decision
 
+    def set_decision_and_update_tx(self, tx_id, decision, tx):
+        self.decisions[tx_id] = decision
+        self.txs[tx.tx_id] = tx
+
     def get_decision(self, tx_id):
         return self.decisions.get(tx_id)
 
     def set_commit_fence(self, order_id, tx_id):
         self.fences[order_id] = tx_id
+
+    def set_decision_fence_and_update_tx(self, tx_id, decision, order_id, tx):
+        self.decisions[tx_id] = decision
+        self.fences[order_id] = tx_id
+        self.txs[tx.tx_id] = tx
 
     def get_commit_fence(self, order_id):
         return self.fences.get(order_id)
@@ -109,6 +118,12 @@ class _MockTxStore:
 
     def clear_active_tx_guard(self, order_id):
         self.guards.pop(order_id, None)
+
+    def clear_active_tx_guard_if_owned(self, order_id, tx_id):
+        if self.guards.get(order_id) not in {None, tx_id}:
+            return False
+        self.guards.pop(order_id, None)
+        return True
 
     def refresh_active_tx_guard(self, order_id, ttl):
         return order_id in self.guards
@@ -294,6 +309,28 @@ class TestSagaProtocol(unittest.TestCase):
         # FAILED_NEEDS_RECOVERY is NOT terminal
         self.assertNotIn(STATUS_FAILED_NEEDS_RECOVERY, TERMINAL_STATUSES)
 
+    def test_saga_mark_paid_indeterminate_sets_failed_needs_recovery(self, mock_queue, mock_publish):
+        hold = [_stock_reply("tx", ok=True), _payment_reply("tx", ok=True)]
+        order_port = _MockOrderPort()
+
+        def _boom(order_id, tx_id):
+            raise OrderPortUnavailable("mark_paid_timeout")
+
+        order_port.mark_paid = _boom
+
+        result, _, ts = self._run(
+            mock_queue,
+            mock_publish,
+            hold_replies=hold,
+            order_port=order_port,
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "mark_paid_indeterminate")
+        tx = list(ts.txs.values())[0]
+        self.assertEqual(tx.status, STATUS_FAILED_NEEDS_RECOVERY)
+        self.assertEqual(tx.last_error, "mark_paid_indeterminate")
+
 
 @patch("coordinator.service.publish_command")
 @patch("coordinator.service.get_reply_queue", return_value="test.replies")
@@ -358,7 +395,7 @@ class TestTwoPCProtocol(unittest.TestCase):
         self.assertEqual(tx.status, STATUS_ABORTED)
 
     def test_2pc_decision_before_committing(self, mock_queue, mock_publish):
-        """Verify decision marker written before COMMITTING status."""
+        """Verify 2PC persists commit decision + COMMITTING state atomically."""
         hold = [_stock_reply("tx", ok=True), _payment_reply("tx", ok=True)]
         commit = [_stock_reply("tx", ok=True, command=CMD_COMMIT),
                   _payment_reply("tx", ok=True, command=CMD_COMMIT)]
@@ -366,31 +403,24 @@ class TestTwoPCProtocol(unittest.TestCase):
         # Track the order of calls
         call_order = []
         original_tx_store = _MockTxStore()
-        orig_set_decision = original_tx_store.set_decision
-        orig_update_tx = original_tx_store.update_tx
+        orig_persist = original_tx_store.set_decision_fence_and_update_tx
 
-        def track_set_decision(tx_id, decision):
-            call_order.append(("set_decision", decision))
-            return orig_set_decision(tx_id, decision)
+        def track_persist(tx_id, decision, order_id, tx):
+            call_order.append(("persist_commit_state", decision, tx.status, order_id))
+            return orig_persist(tx_id, decision, order_id, tx)
 
-        def track_update_tx(tx):
-            call_order.append(("update_tx", tx.status))
-            return orig_update_tx(tx)
-
-        original_tx_store.set_decision = track_set_decision
-        original_tx_store.update_tx = track_update_tx
+        original_tx_store.set_decision_fence_and_update_tx = track_persist
 
         result, _, ts = self._run(mock_queue, mock_publish,
                                   hold_replies=hold, commit_replies=commit,
                                   tx_store=original_tx_store)
 
-        # Find where commit decision and COMMITTING status appear
-        decision_idx = next(i for i, c in enumerate(call_order)
-                           if c == ("set_decision", "commit"))
-        committing_idx = next(i for i, c in enumerate(call_order)
-                              if c == ("update_tx", STATUS_COMMITTING))
-        self.assertLess(decision_idx, committing_idx,
-                        "Decision must be written before COMMITTING status")
+        self.assertTrue(result.success)
+        self.assertIn(
+            ("persist_commit_state", "commit", STATUS_COMMITTING, "order-1"),
+            call_order,
+            "2PC must persist decision and COMMITTING status in one tx-store call",
+        )
 
     def test_2pc_mark_paid_before_completed(self, mock_queue, mock_publish):
         """2PC: mark_paid must be called before STATUS_COMPLETED is written.
@@ -455,6 +485,32 @@ class TestTwoPCProtocol(unittest.TestCase):
                             "COMPLETED must never be written when mark_paid fails")
         self.assertEqual(tx.status, STATUS_FAILED_NEEDS_RECOVERY)
         self.assertEqual(tx.last_error, "mark_paid_failed")
+
+    def test_2pc_mark_paid_indeterminate_sets_failed_needs_recovery(self, mock_queue, mock_publish):
+        hold = [_stock_reply("tx", ok=True), _payment_reply("tx", ok=True)]
+        commit = [_stock_reply("tx", ok=True, command=CMD_COMMIT),
+                  _payment_reply("tx", ok=True, command=CMD_COMMIT)]
+
+        order_port = _MockOrderPort()
+
+        def _boom(order_id, tx_id):
+            raise OrderPortUnavailable("mark_paid_timeout")
+
+        order_port.mark_paid = _boom
+
+        result, _, ts = self._run(
+            mock_queue,
+            mock_publish,
+            hold_replies=hold,
+            commit_replies=commit,
+            order_port=order_port,
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "mark_paid_indeterminate")
+        tx = list(ts.txs.values())[0]
+        self.assertEqual(tx.status, STATUS_FAILED_NEEDS_RECOVERY)
+        self.assertEqual(tx.last_error, "mark_paid_indeterminate")
 
     def test_2pc_commit_incomplete_order_not_paid(self, mock_queue, mock_publish):
         """2PC: if commits don't confirm, order must NOT be marked paid."""

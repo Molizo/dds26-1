@@ -1,5 +1,16 @@
 # Phase 2 Extraction Notes: Standalone Orchestrator
 
+## Status Update
+
+Updated on **March 19, 2026**:
+
+1. The active implementation now uses RabbitMQ request/reply for all internal `order-service` <-> `orchestrator` coordination.
+2. Public checkout still enters `order-service`, but it no longer forwards to the orchestrator over internal HTTP.
+3. The old `GET /internal/orders/{order_id}` and `POST /internal/orders/{order_id}/mark_paid` plan has been removed from the codebase; order reads and mark-paid now run through internal MQ commands.
+4. The orchestrator remains internal-only in both docker-compose and Kubernetes.
+
+The transport details in the rest of this document are historical planning context. Where they conflict with the implementation above, the MQ-based internal contract is the current source of truth.
+
 ## Purpose
 
 This document captures the intended Phase 2 direction from `assignment.md` without expanding the current Phase 1 implementation scope too early.

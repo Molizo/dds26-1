@@ -42,14 +42,8 @@ spec:
           env:
             - name: STOCK_SERVICE_URL
               value: "http://stock-service:5000"
-            - name: PAYMENT_SERVICE_URL
-              value: "http://payment-service:5000"
             - name: RABBITMQ_URL
               value: "amqp://guest:guest@rabbitmq:5672/"
-            - name: COORDINATOR_REPLY_PREFETCH_COUNT
-              value: "64"
-            - name: CHECKOUT_PROTOCOL
-              value: "saga"
             - name: REDIS_HOST
               value: "order-db"
             - name: REDIS_PORT

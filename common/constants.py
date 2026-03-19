@@ -3,6 +3,15 @@ CMD_HOLD = "hold"
 CMD_RELEASE = "release"
 CMD_COMMIT = "commit"
 
+# Internal orchestrator command names
+ORCHESTRATOR_CMD_CHECKOUT = "checkout"
+ORCHESTRATOR_CMD_ACQUIRE_MUTATION_GUARD = "acquire_mutation_guard"
+ORCHESTRATOR_CMD_RELEASE_MUTATION_GUARD = "release_mutation_guard"
+
+# Internal order command names
+ORDER_CMD_READ_ORDER = "read_order"
+ORDER_CMD_MARK_PAID = "mark_paid"
+
 # Participant service names (used in ParticipantReply.service)
 SVC_STOCK = "stock"
 SVC_PAYMENT = "payment"
@@ -41,3 +50,7 @@ STOCK_COMMANDS_QUEUE = "stock.commands"
 PAYMENT_COMMANDS_QUEUE = "payment.commands"
 STOCK_COMMANDS_DLQ = "stock.commands.dlq"
 PAYMENT_COMMANDS_DLQ = "payment.commands.dlq"
+ORDER_COMMANDS_QUEUE = "order.commands"
+ORCHESTRATOR_COMMANDS_QUEUE = "orchestrator.commands"
+ORDER_COMMANDS_DLQ = "order.commands.dlq"
+ORCHESTRATOR_COMMANDS_DLQ = "orchestrator.commands.dlq"

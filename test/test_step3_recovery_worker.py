@@ -55,6 +55,12 @@ class _MockTxStore:
     def clear_active_tx_guard(self, order_id):
         self.guards.pop(order_id, None)
 
+    def clear_active_tx_guard_if_owned(self, order_id, tx_id):
+        if self.guards.get(order_id) != tx_id:
+            return False
+        self.guards.pop(order_id, None)
+        return True
+
     def refresh_active_tx_guard(self, order_id, ttl):
         if order_id not in self.guards:
             return False

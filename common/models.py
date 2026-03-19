@@ -20,6 +20,15 @@ class PaymentHoldPayload(msgspec.Struct):
     amount: int
 
 
+class OrderSnapshotPayload(msgspec.Struct):
+    """Order state transferred over internal RPC."""
+    order_id: str
+    user_id: str
+    total_cost: int
+    paid: bool
+    items: list[tuple[str, int]]
+
+
 class ParticipantCommand(msgspec.Struct):
     """Coordinator → participant command message."""
     tx_id: str
@@ -46,10 +55,32 @@ class ParticipantReply(msgspec.Struct):
     error: Optional[str] = None
 
 
+class InternalCommand(msgspec.Struct):
+    """Internal RabbitMQ RPC command between order-service and orchestrator."""
+    request_id: str
+    command: str
+    order_id: str
+    tx_id: Optional[str] = None
+    lease_id: Optional[str] = None
+
+
+class InternalReply(msgspec.Struct):
+    """Internal RabbitMQ RPC reply between order-service and orchestrator."""
+    request_id: str
+    command: str
+    ok: bool
+    error: Optional[str] = None
+    snapshot: Optional[OrderSnapshotPayload] = None
+    status_code: Optional[int] = None
+    reason: Optional[str] = None
+
+
 # Pre-built encoder/decoder instances for efficient reuse
 _encoder = msgspec.msgpack.Encoder()
 _cmd_decoder = msgspec.msgpack.Decoder(ParticipantCommand)
 _reply_decoder = msgspec.msgpack.Decoder(ParticipantReply)
+_internal_cmd_decoder = msgspec.msgpack.Decoder(InternalCommand)
+_internal_reply_decoder = msgspec.msgpack.Decoder(InternalReply)
 
 
 def encode_command(cmd: ParticipantCommand) -> bytes:
@@ -66,3 +97,19 @@ def encode_reply(reply: ParticipantReply) -> bytes:
 
 def decode_reply(data: bytes) -> ParticipantReply:
     return _reply_decoder.decode(data)
+
+
+def encode_internal_command(cmd: InternalCommand) -> bytes:
+    return _encoder.encode(cmd)
+
+
+def decode_internal_command(data: bytes) -> InternalCommand:
+    return _internal_cmd_decoder.decode(data)
+
+
+def encode_internal_reply(reply: InternalReply) -> bytes:
+    return _encoder.encode(reply)
+
+
+def decode_internal_reply(data: bytes) -> InternalReply:
+    return _internal_reply_decoder.decode(data)

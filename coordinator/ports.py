@@ -13,6 +13,10 @@ from typing import Optional, Protocol
 from coordinator.models import CheckoutTxValue
 
 
+class OrderPortUnavailable(RuntimeError):
+    """Raised when the order service cannot confirm an RPC result."""
+
+
 class OrderSnapshot:
     """Lightweight snapshot of order state needed by the coordinator."""
     __slots__ = ("order_id", "user_id", "total_cost", "paid", "items")
@@ -80,6 +84,8 @@ class TxStorePort(Protocol):
     def get_active_tx_guard(self, order_id: str) -> Optional[str]: ...
 
     def clear_active_tx_guard(self, order_id: str) -> None: ...
+
+    def clear_active_tx_guard_if_owned(self, order_id: str, tx_id: str) -> bool: ...
 
     def refresh_active_tx_guard(self, order_id: str, ttl: int) -> bool: ...
 

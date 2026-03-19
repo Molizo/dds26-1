@@ -10,30 +10,12 @@ duck typing is sufficient.
 """
 from typing import Optional, Protocol
 
+from common.models import OrderSnapshot
 from coordinator.models import CheckoutTxValue
 
 
 class OrderPortUnavailable(RuntimeError):
     """Raised when the order service cannot confirm an RPC result."""
-
-
-class OrderSnapshot:
-    """Lightweight snapshot of order state needed by the coordinator."""
-    __slots__ = ("order_id", "user_id", "total_cost", "paid", "items")
-
-    def __init__(
-        self,
-        order_id: str,
-        user_id: str,
-        total_cost: int,
-        paid: bool,
-        items: list[tuple[str, int]],
-    ):
-        self.order_id = order_id
-        self.user_id = user_id
-        self.total_cost = total_cost
-        self.paid = paid
-        self.items = items
 
 
 class OrderPort(Protocol):

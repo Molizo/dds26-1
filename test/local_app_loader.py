@@ -31,17 +31,43 @@ def load_order_app():
     os.environ.setdefault("REDIS_PASSWORD", "")
     os.environ.setdefault("REDIS_DB", "0")
 
-    store_module = _load_module("_test_order_store", os.path.join(ORDER_DIR, "store.py"))
-
+    lua_module = _load_module("_test_order_lua_scripts", os.path.join(ORDER_DIR, "lua_scripts.py"))
     original_store = sys.modules.get("store")
-    sys.modules["store"] = store_module
+    original_lua = sys.modules.get("lua_scripts")
+    original_domain_service = sys.modules.get("domain_service")
+    original_orchestrator_client = sys.modules.get("orchestrator_client")
     try:
+        sys.modules["lua_scripts"] = lua_module
+        store_module = _load_module("_test_order_store", os.path.join(ORDER_DIR, "store.py"))
+        sys.modules["store"] = store_module
+        domain_service_module = _load_module(
+            "_test_order_domain_service",
+            os.path.join(ORDER_DIR, "domain_service.py"),
+        )
+        orchestrator_client_module = _load_module(
+            "_test_order_orchestrator_client",
+            os.path.join(ORDER_DIR, "orchestrator_client.py"),
+        )
+        sys.modules["domain_service"] = domain_service_module
+        sys.modules["orchestrator_client"] = orchestrator_client_module
         app_module = _load_module("_test_order_app", os.path.join(ORDER_DIR, "app.py"))
     finally:
         if original_store is None:
             sys.modules.pop("store", None)
         else:
             sys.modules["store"] = original_store
+        if original_lua is None:
+            sys.modules.pop("lua_scripts", None)
+        else:
+            sys.modules["lua_scripts"] = original_lua
+        if original_domain_service is None:
+            sys.modules.pop("domain_service", None)
+        else:
+            sys.modules["domain_service"] = original_domain_service
+        if original_orchestrator_client is None:
+            sys.modules.pop("orchestrator_client", None)
+        else:
+            sys.modules["orchestrator_client"] = original_orchestrator_client
 
     return app_module, store_module
 

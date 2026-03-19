@@ -20,8 +20,8 @@ class PaymentHoldPayload(msgspec.Struct):
     amount: int
 
 
-class OrderSnapshotPayload(msgspec.Struct):
-    """Order state transferred over internal RPC."""
+class OrderSnapshot(msgspec.Struct):
+    """Canonical internal snapshot of order state."""
     order_id: str
     user_id: str
     total_cost: int
@@ -70,7 +70,7 @@ class InternalReply(msgspec.Struct):
     command: str
     ok: bool
     error: Optional[str] = None
-    snapshot: Optional[OrderSnapshotPayload] = None
+    snapshot: Optional[OrderSnapshot] = None
     status_code: Optional[int] = None
     reason: Optional[str] = None
 

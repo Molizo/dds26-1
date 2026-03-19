@@ -5,11 +5,12 @@ from typing import Optional
 from common.constants import ORDER_CMD_MARK_PAID, ORDER_CMD_READ_ORDER, ORDER_COMMANDS_QUEUE
 from common.models import (
     InternalCommand,
+    OrderSnapshot,
     decode_internal_reply,
     encode_internal_command,
 )
 from common.rpc import rpc_request_bytes
-from coordinator.ports import OrderPortUnavailable, OrderSnapshot
+from coordinator.ports import OrderPortUnavailable
 
 
 class RabbitMqOrderPort:

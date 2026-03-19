@@ -13,33 +13,15 @@ Thread-safety:
 - Publisher connections are thread-local (handled by common.messaging).
 """
 import logging
-import os
 import threading
-import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
-import pika
-
+from common.amqp_consumers import start_exclusive_reply_consumer
+from common.env import get_positive_int_env
 from common.models import ParticipantReply, decode_reply
 
 logger = logging.getLogger(__name__)
-
-
-def _get_positive_int_env(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        parsed = int(value)
-        if parsed > 0:
-            return parsed
-    except ValueError:
-        pass
-    logger.warning("Invalid %s=%r, using default=%d", name, value, default)
-    return default
-
 # ---------------------------------------------------------------------------
 # Correlation map
 # ---------------------------------------------------------------------------
@@ -116,39 +98,15 @@ def init_reply_consumer(rabbitmq_url: str) -> threading.Thread:
     Returns the daemon thread.
     """
     global _reply_queue
-    _reply_queue = f"coordinator.replies.{uuid.uuid4().hex[:12]}"
-
-    thread = threading.Thread(
-        target=_run_reply_consumer,
-        args=(rabbitmq_url, _reply_queue),
-        daemon=True,
-        name=f"reply-consumer-{_reply_queue}",
+    _reply_queue, thread = start_exclusive_reply_consumer(
+        rabbitmq_url,
+        queue_prefix="coordinator.replies",
+        thread_name_prefix="reply-consumer",
+        prefetch_count=get_positive_int_env("COORDINATOR_REPLY_PREFETCH_COUNT", 10, logger),
+        on_message_callback=_on_reply,
+        logger=logger,
     )
-    thread.start()
-    logger.info("Reply consumer thread started for queue=%s", _reply_queue)
     return thread
-
-
-def _run_reply_consumer(rabbitmq_url: str, queue_name: str) -> None:
-    """Consumer thread body. Auto-reconnects with exponential backoff."""
-    backoff = 1
-    prefetch_count = _get_positive_int_env("COORDINATOR_REPLY_PREFETCH_COUNT", 10)
-    while True:
-        try:
-            conn = pika.BlockingConnection(pika.URLParameters(rabbitmq_url))
-            channel = conn.channel()
-            # Declare exclusive auto-delete queue
-            channel.queue_declare(queue=queue_name, exclusive=True, auto_delete=True)
-            channel.basic_qos(prefetch_count=prefetch_count)
-            channel.basic_consume(queue=queue_name, on_message_callback=_on_reply)
-            logger.info("Reply consumer ready on queue=%s", queue_name)
-            backoff = 1
-            channel.start_consuming()
-        except Exception as exc:
-            logger.error("Reply consumer error on queue=%s: %s — reconnecting in %ds",
-                         queue_name, exc, backoff)
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 30)
 
 
 def _on_reply(channel, method, properties, body: bytes) -> None:

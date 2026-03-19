@@ -7,6 +7,25 @@ It should be updated whenever implementation reveals a new constraint, incorrect
 
 Use this log to avoid repeating known mistakes and to justify walking back earlier decisions when needed.
 
+## 2026-03-19 - Stable service-dir entrypoints still diverge from repo-root unit-test imports
+
+- Limitation encountered:
+  - Keeping each microservice runnable from its own copied service directory means local modules are imported by short names such as `store`, `runtime_service`, or `internal_handler`.
+  - Repo-root unit tests load those same files through custom module loaders, so service-local imports are not automatically resolvable there.
+
+- Why the current design caused it:
+  - Dockerfiles still copy each service into `/home/flask-app` as flat modules to preserve existing Gunicorn and Flask entrypoints.
+  - The cleanup pass intentionally avoided a package-layout rewrite, so imports could not be normalized around one package root without changing deployment assumptions.
+
+- Impact:
+  - Delivery risk: local test harnesses need explicit module injection for service-local helpers, or refactors fail in tests despite being valid in containers.
+  - Reliability risk: ad-hoc import fallbacks inside production modules become tempting and can leak environment-specific behavior into runtime code.
+
+- Chosen mitigation or follow-up action:
+  - Keep production modules using the service-dir import shape expected by the deployed containers.
+  - Extend local test loaders to inject service-local modules explicitly.
+  - Prefer runtime/handler dependency injection over importing Flask app symbols across modules so the remaining environment-specific wiring stays at startup boundaries.
+
 ## 2026-03-19 - Extracting the orchestrator over internal HTTP preserved worker deadlocks and ambiguous side effects
 
 - Limitation encountered:

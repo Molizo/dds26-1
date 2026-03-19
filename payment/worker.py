@@ -7,13 +7,14 @@ import logging
 import redis
 
 from common.constants import CMD_HOLD, CMD_RELEASE, CMD_COMMIT, SVC_PAYMENT
-from common.messaging import publish_reply, start_participant_consumer
+from common.messaging import start_participant_consumer
 from common.models import (
     ParticipantCommand,
     ParticipantReply,
     decode_command,
     encode_reply,
 )
+from common.worker_support import handle_participant_delivery
 from common.constants import PAYMENT_COMMANDS_QUEUE
 import service as payment_service
 
@@ -36,21 +37,17 @@ def start_consumer_thread() -> None:
 
 
 def _handle_command(channel, method, properties, body: bytes) -> None:
-    try:
-        cmd: ParticipantCommand = decode_command(body)
-    except Exception as exc:
-        logger.error("Failed to decode payment command: %s", exc)
-        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-        return
-
-    logger.info("payment cmd tx=%s command=%s", cmd.tx_id, cmd.command)
-    reply = _dispatch(cmd)
-    channel.basic_ack(delivery_tag=method.delivery_tag)
-
-    try:
-        publish_reply(_rabbitmq_url, cmd.reply_to, encode_reply(reply))
-    except Exception as exc:
-        logger.error("Failed to publish reply for tx=%s: %s", cmd.tx_id, exc)
+    handle_participant_delivery(
+        channel=channel,
+        method=method,
+        body=body,
+        rabbitmq_url=_rabbitmq_url,
+        service_name="payment",
+        decode_command=decode_command,
+        dispatch=_dispatch,
+        encode_reply=encode_reply,
+        logger=logger,
+    )
 
 
 def _dispatch(cmd: ParticipantCommand) -> ParticipantReply:

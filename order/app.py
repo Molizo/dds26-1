@@ -1,29 +1,21 @@
 import atexit
 import logging
 import os
-import random
-import time
 import uuid
 
 import redis
 import requests
 from flask import Flask, Response, abort, jsonify
-from msgspec import msgpack
 
 from common.constants import (
     ORCHESTRATOR_CMD_ACQUIRE_MUTATION_GUARD,
     ORCHESTRATOR_CMD_CHECKOUT,
     ORCHESTRATOR_CMD_RELEASE_MUTATION_GUARD,
-    ORCHESTRATOR_COMMANDS_QUEUE,
 )
-from common.models import (
-    InternalCommand,
-    InternalReply,
-    decode_internal_reply,
-    encode_internal_command,
-)
-from common.rpc import rpc_request_bytes
-from store import OrderValue, get_order
+from common.models import InternalReply
+import domain_service
+from orchestrator_client import MutationGuardAcquireResult, OrchestratorClient
+from store import OrderValue
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -57,8 +49,28 @@ atexit.register(close_db_connection)
 _session = requests.Session()
 
 
+def _get_order_service() -> domain_service.OrderService:
+    return domain_service.OrderService(
+        db,
+        order_update_retry_count=ORDER_UPDATE_RETRY_COUNT,
+    )
+
+
+def _get_orchestrator_client() -> OrchestratorClient:
+    if not hasattr(_get_orchestrator_client, "_instance"):
+        _get_orchestrator_client._instance = OrchestratorClient(
+            RABBITMQ_URL,
+            rpc_timeout_seconds=RPC_TIMEOUT_SECONDS,
+            checkout_timeout_seconds=CHECKOUT_RPC_TIMEOUT_SECONDS,
+            guard_retry_count=MUTATION_GUARD_RETRY_COUNT,
+            guard_retry_delay_seconds=MUTATION_GUARD_RETRY_DELAY_SECONDS,
+            logger=app.logger,
+        )
+    return _get_orchestrator_client._instance
+
+
 def _get_order_or_abort(order_id: str) -> OrderValue:
-    order = get_order(db, order_id)
+    order = _get_order_service().find_order(order_id)
     if order is None:
         abort(400, f"Order: {order_id} not found!")
     return order
@@ -97,83 +109,32 @@ def _call_orchestrator(
     lease_id: str | None = None,
     timeout_seconds: float = RPC_TIMEOUT_SECONDS,
 ) -> InternalReply | None:
-    request_id = str(uuid.uuid4())
-    payload = encode_internal_command(
-        InternalCommand(
-            request_id=request_id,
-            command=command,
-            order_id=order_id,
-            tx_id=tx_id,
-            lease_id=lease_id,
-        )
-    )
-    reply = rpc_request_bytes(
-        RABBITMQ_URL,
-        ORCHESTRATOR_COMMANDS_QUEUE,
-        request_id=request_id,
-        body=payload,
+    client = _get_orchestrator_client()
+    if command == ORCHESTRATOR_CMD_CHECKOUT:
+        if tx_id is None:
+            raise ValueError("tx_id is required for checkout")
+        return client.checkout(order_id, tx_id)
+    return client._call(
+        command,
+        order_id,
+        tx_id=tx_id,
+        lease_id=lease_id,
         timeout_seconds=timeout_seconds,
     )
-    if reply is None:
-        return None
-    return decode_internal_reply(reply)
 
 
 def _release_mutation_guard(order_id: str, lease_id: str) -> None:
-    try:
-        _call_orchestrator(
-            ORCHESTRATOR_CMD_RELEASE_MUTATION_GUARD,
-            order_id,
-            lease_id=lease_id,
-            timeout_seconds=RPC_TIMEOUT_SECONDS,
-        )
-    except Exception:
-        app.logger.exception(
-            "Failed releasing order mutation guard order=%s lease=%s",
-            order_id,
-            lease_id,
-        )
+    _get_orchestrator_client().release_mutation_guard(order_id, lease_id)
 
 
-def _acquire_mutation_guard(order_id: str) -> str:
-    lease_id = str(uuid.uuid4())
-
-    for _ in range(MUTATION_GUARD_RETRY_COUNT):
-        try:
-            reply = _call_orchestrator(
-                ORCHESTRATOR_CMD_ACQUIRE_MUTATION_GUARD,
-                order_id,
-                lease_id=lease_id,
-                timeout_seconds=RPC_TIMEOUT_SECONDS,
-            )
-        except Exception as exc:
-            app.logger.warning("Acquire mutation guard failed order=%s lease=%s: %s", order_id, lease_id, exc)
-            time.sleep(MUTATION_GUARD_RETRY_DELAY_SECONDS)
-            continue
-
-        if reply is None:
-            time.sleep(MUTATION_GUARD_RETRY_DELAY_SECONDS)
-            continue
-        if reply.ok and reply.status_code == 200:
-            return lease_id
-        if reply.status_code == 409 and reply.reason == "mutation_in_progress":
-            time.sleep(MUTATION_GUARD_RETRY_DELAY_SECONDS)
-            continue
-        if reply.status_code == 409 and reply.reason == "checkout_in_progress":
-            abort(409, "Checkout already in progress")
-        abort(reply.status_code, reply.error or "Could not verify checkout state")
-
-    _release_mutation_guard(order_id, lease_id)
-    abort(400, "Could not verify checkout state")
+def _acquire_mutation_guard(order_id: str) -> MutationGuardAcquireResult:
+    return _get_orchestrator_client().acquire_mutation_guard(order_id)
 
 
 @app.post("/create/<user_id>")
 def create_order(user_id: str):
-    key = str(uuid.uuid4())
-    value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
-    try:
-        db.set(key, value)
-    except redis.exceptions.RedisError:
+    key = _get_order_service().create_order(user_id)
+    if key is None:
         return abort(400, DB_ERROR_STR)
     return jsonify({"order_id": key})
 
@@ -185,21 +146,7 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     n_users = int(n_users)
     item_price = int(item_price)
 
-    def generate_entry() -> OrderValue:
-        user_id = random.randint(0, max(0, n_users - 1))
-        item1_id = random.randint(0, max(0, n_items - 1))
-        item2_id = random.randint(0, max(0, n_items - 1))
-        return OrderValue(
-            paid=False,
-            items=[(f"{item1_id}", 1), (f"{item2_id}", 1)],
-            user_id=f"{user_id}",
-            total_cost=2 * item_price,
-        )
-
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry()) for i in range(n)}
-    try:
-        db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
+    if not _get_order_service().batch_init_orders(n, n_items, n_users, item_price):
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for orders successful"})
 
@@ -218,16 +165,17 @@ def find_order(order_id: str):
     )
 
 
-def _precheck_order_for_add_item(order_id: str) -> None:
+def _precheck_order_for_add_item(order_id: str) -> tuple[bool, int | None, str | None]:
     order_paid_key = f"order_paid:{order_id}"
     try:
-        order = get_order(db, order_id)
+        order = _get_order_service().find_order(order_id)
         if order is None:
-            abort(400, f"Order: {order_id} not found!")
+            return False, 400, f"Order: {order_id} not found!"
         if order.paid or db.exists(order_paid_key) == 1:
-            abort(409, "Order already paid")
+            return False, 409, "Order already paid"
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        return False, 400, DB_ERROR_STR
+    return True, None, None
 
 
 @app.post("/addItem/<order_id>/<item_id>/<quantity>")
@@ -237,44 +185,31 @@ def add_item(order_id: str, item_id: str, quantity: int):
     if item_reply.status_code != 200:
         abort(400, f"Item: {item_id} does not exist!")
 
-    _precheck_order_for_add_item(order_id)
+    ok, status_code, error = _precheck_order_for_add_item(order_id)
+    if not ok:
+        abort(status_code, error)
     item_json: dict = item_reply.json()
     price = int(item_json["price"])
-    order_paid_key = f"order_paid:{order_id}"
-    lease_id = _acquire_mutation_guard(order_id)
+    guard = _acquire_mutation_guard(order_id)
+    if not guard.ok or guard.lease_id is None:
+        abort(guard.status_code, guard.error or "Could not verify checkout state")
 
     try:
-        for _ in range(ORDER_UPDATE_RETRY_COUNT):
-            try:
-                with db.pipeline() as pipe:
-                    pipe.watch(order_id, order_paid_key)
-                    raw_order = pipe.get(order_id)
-                    if raw_order is None:
-                        pipe.unwatch()
-                        abort(400, f"Order: {order_id} not found!")
-
-                    order = msgpack.decode(raw_order, type=OrderValue)
-                    if order.paid or pipe.exists(order_paid_key) == 1:
-                        pipe.unwatch()
-                        abort(409, "Order already paid")
-
-                    order.items.append((item_id, quantity))
-                    order.total_cost += quantity * price
-
-                    pipe.multi()
-                    pipe.set(order_id, msgpack.encode(order))
-                    pipe.execute()
-                    return Response(
-                        f"Item: {item_id} added to: {order_id} price updated to: {order.total_cost}",
-                        status=200,
-                    )
-            except redis.WatchError:
-                continue
-            except redis.exceptions.RedisError:
-                return abort(400, DB_ERROR_STR)
+        result = _get_order_service().add_item(order_id, item_id, quantity, price)
     finally:
-        _release_mutation_guard(order_id, lease_id)
+        _release_mutation_guard(order_id, guard.lease_id)
 
+    if result.status == "ok":
+        return Response(
+            f"Item: {item_id} added to: {order_id} price updated to: {result.total_cost}",
+            status=200,
+        )
+    if result.status == "not_found":
+        abort(400, f"Order: {order_id} not found!")
+    if result.status == "already_paid":
+        abort(409, "Order already paid")
+    if result.status == "db_error":
+        abort(400, DB_ERROR_STR)
     abort(409, "Conflict: could not update order")
 
 

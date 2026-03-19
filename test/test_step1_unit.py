@@ -23,14 +23,18 @@ from common.constants import (
     PROTOCOL_SAGA, PROTOCOL_2PC,
 )
 from common.models import (
+    InternalReply,
+    OrderSnapshot,
     ParticipantCommand,
     ParticipantReply,
-    StockHoldPayload,
     PaymentHoldPayload,
-    encode_command,
+    StockHoldPayload,
     decode_command,
-    encode_reply,
+    decode_internal_reply,
     decode_reply,
+    encode_command,
+    encode_internal_reply,
+    encode_reply,
 )
 from common.result import CheckoutResult
 
@@ -153,6 +157,25 @@ class TestMessageRoundTrip(unittest.TestCase):
         )
         decoded = decode_command(encode_command(cmd))
         self.assertEqual(decoded.stock_payload.items, [])
+
+    def test_internal_reply_snapshot_roundtrip(self):
+        reply = InternalReply(
+            request_id="req-1",
+            command="read_order",
+            ok=True,
+            snapshot=OrderSnapshot(
+                order_id="order-1",
+                user_id="user-1",
+                total_cost=42,
+                paid=False,
+                items=[("item-1", 2), ("item-2", 1)],
+            ),
+        )
+        decoded = decode_internal_reply(encode_internal_reply(reply))
+        self.assertTrue(decoded.ok)
+        self.assertIsNotNone(decoded.snapshot)
+        self.assertEqual(decoded.snapshot.order_id, "order-1")
+        self.assertEqual(decoded.snapshot.items, [("item-1", 2), ("item-2", 1)])
 
 
 class TestCheckoutResult(unittest.TestCase):

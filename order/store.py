@@ -4,11 +4,14 @@ The order service owns order records and the paid marker. Coordinator transactio
 state moved to orchestrator-owned storage in Phase 2.
 """
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
 import msgspec
 import redis
 
+import lua_scripts
+from common.models import OrderSnapshot
 from msgspec import msgpack
 from redis.commands.core import Script
 
@@ -22,17 +25,15 @@ class OrderValue(msgspec.Struct):
     total_cost: int
 
 
-class OrderSnapshotValue(msgspec.Struct):
-    order_id: str
-    user_id: str
-    total_cost: int
-    paid: bool
-    items: list[tuple[str, int]]
-
-
 _order_encoder = msgspec.msgpack.Encoder()
 _order_decoder = msgspec.msgpack.Decoder(OrderValue)
 _mark_paid_script: Optional[Script] = None
+
+
+@dataclass(frozen=True)
+class AddItemResult:
+    status: str
+    total_cost: int | None = None
 
 
 def get_order(db: redis.Redis, order_id: str) -> Optional[OrderValue]:
@@ -47,7 +48,7 @@ def get_order(db: redis.Redis, order_id: str) -> Optional[OrderValue]:
     return _order_decoder.decode(raw)
 
 
-def read_order_snapshot(db: redis.Redis, order_id: str) -> Optional[OrderSnapshotValue]:
+def read_order_snapshot(db: redis.Redis, order_id: str) -> Optional[OrderSnapshot]:
     """Return the current order snapshot for internal orchestrator calls."""
     order = get_order(db, order_id)
     if order is None:
@@ -60,7 +61,7 @@ def read_order_snapshot(db: redis.Redis, order_id: str) -> Optional[OrderSnapsho
         except redis.exceptions.RedisError:
             pass
 
-    return OrderSnapshotValue(
+    return OrderSnapshot(
         order_id=order_id,
         user_id=order.user_id,
         total_cost=order.total_cost,
@@ -72,11 +73,7 @@ def read_order_snapshot(db: redis.Redis, order_id: str) -> Optional[OrderSnapsho
 def _get_mark_paid_script(db: redis.Redis) -> Script:
     global _mark_paid_script
     if _mark_paid_script is None:
-        try:
-            from lua_scripts import MARK_ORDER_PAID
-        except ModuleNotFoundError:
-            from order.lua_scripts import MARK_ORDER_PAID
-        _mark_paid_script = db.register_script(MARK_ORDER_PAID)
+        _mark_paid_script = db.register_script(lua_scripts.MARK_ORDER_PAID)
     return _mark_paid_script
 
 
@@ -109,3 +106,44 @@ def mark_order_paid(db: redis.Redis, order_id: str) -> bool:
     except redis.exceptions.RedisError as exc:
         logger.error("Redis error marking order paid %s: %s", order_id, exc)
         return False
+
+
+def add_item_to_order(
+    db: redis.Redis,
+    order_id: str,
+    item_id: str,
+    quantity: int,
+    price: int,
+    *,
+    retry_count: int,
+) -> AddItemResult:
+    order_paid_key = f"order_paid:{order_id}"
+
+    for _ in range(retry_count):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(order_id, order_paid_key)
+                raw_order = pipe.get(order_id)
+                if raw_order is None:
+                    pipe.unwatch()
+                    return AddItemResult(status="not_found")
+
+                order = msgpack.decode(raw_order, type=OrderValue)
+                if order.paid or pipe.exists(order_paid_key) == 1:
+                    pipe.unwatch()
+                    return AddItemResult(status="already_paid")
+
+                order.items.append((item_id, quantity))
+                order.total_cost += quantity * price
+
+                pipe.multi()
+                pipe.set(order_id, msgpack.encode(order))
+                pipe.execute()
+                return AddItemResult(status="ok", total_cost=order.total_cost)
+        except redis.WatchError:
+            continue
+        except redis.exceptions.RedisError as exc:
+            logger.error("Redis error adding item order=%s item=%s: %s", order_id, item_id, exc)
+            return AddItemResult(status="db_error")
+
+    return AddItemResult(status="conflict")

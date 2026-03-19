@@ -4,29 +4,40 @@ Each worker starts its own reply-consumer thread. Recovery startup also runs in
 each worker, but only the current Redis leader performs scans.
 """
 import logging
-import os
+
+from common.gunicorn import rabbitmq_url_from_env, run_post_fork_bootstrap
 
 logger = logging.getLogger(__name__)
 
 
 def post_fork(server, worker):
-    rabbitmq_url = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
-
     from common.rpc import init_rpc_reply_consumer
     from coordinator.messaging import init_reply_consumer
     from coordinator.recovery import start_recovery_worker
-    from app import _get_coordinator, _TxStoreImpl
+    from app import _get_runtime
     from worker import init_worker, start_consumer_thread
 
-    init_rpc_reply_consumer(rabbitmq_url, prefix="orchestrator.rpc.replies")
-    init_reply_consumer(rabbitmq_url)
-    init_worker(rabbitmq_url)
-    start_consumer_thread()
-    start_recovery_worker(
-        coordinator=_get_coordinator(),
-        tx_store=_TxStoreImpl(),
+    rabbitmq_url = rabbitmq_url_from_env()
+    runtime = _get_runtime()
+    run_post_fork_bootstrap(
+        worker,
+        logger,
+        [
+            (
+                "Orchestrator RPC reply consumer",
+                lambda: init_rpc_reply_consumer(rabbitmq_url, prefix="orchestrator.rpc.replies"),
+            ),
+            ("Orchestrator reply consumer", lambda: init_reply_consumer(rabbitmq_url)),
+            (
+                "Orchestrator command consumer",
+                lambda: (init_worker(runtime, rabbitmq_url), start_consumer_thread()),
+            ),
+            (
+                "Orchestrator recovery worker",
+                lambda: start_recovery_worker(
+                    coordinator=runtime.coordinator,
+                    tx_store=runtime.tx_store,
+                ),
+            ),
+        ],
     )
-    logger.info("Orchestrator RPC reply consumer started in pid=%s", worker.pid)
-    logger.info("Orchestrator reply consumer started in pid=%s", worker.pid)
-    logger.info("Orchestrator command consumer started in pid=%s", worker.pid)
-    logger.info("Orchestrator recovery worker started in pid=%s", worker.pid)

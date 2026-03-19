@@ -2,12 +2,13 @@ import os
 import sys
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
-import redis
 from msgspec import msgpack
 
 from common.models import InternalReply
+from helpers.fake_watch_redis import FakeWatchRedis
 from local_app_loader import load_order_app
 
 
@@ -33,110 +34,6 @@ class _FakeResponse:
         return dict(self._payload)
 
 
-class _FakeWatchPipeline:
-    def __init__(self, db):
-        self._db = db
-        self._watched_revisions = {}
-        self._commands = []
-        self._barrier_waited = False
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self.reset()
-        return False
-
-    def watch(self, *keys):
-        with self._db._lock:
-            self._watched_revisions = {
-                key: self._db._revisions.get(key, 0)
-                for key in keys
-            }
-
-    def get(self, key):
-        self._maybe_wait_on_barrier(key)
-        return self._db.get(key)
-
-    def exists(self, key):
-        return self._db.exists(key)
-
-    def multi(self):
-        self._commands = []
-
-    def set(self, key, value):
-        self._commands.append(("set", key, value))
-
-    def execute(self):
-        with self._db._lock:
-            for key, watched_revision in self._watched_revisions.items():
-                if self._db._revisions.get(key, 0) != watched_revision:
-                    raise redis.WatchError()
-
-            for command, key, value in self._commands:
-                if command == "set":
-                    self._db._set_locked(key, value)
-            self.reset()
-
-    def unwatch(self):
-        self.reset()
-
-    def reset(self):
-        self._watched_revisions = {}
-        self._commands = []
-
-    def _maybe_wait_on_barrier(self, key):
-        barrier = self._db._claim_barrier(key)
-        if barrier is None or self._barrier_waited:
-            return
-        self._barrier_waited = True
-        barrier.wait(timeout=2)
-
-
-class _FakeWatchRedis:
-    def __init__(self):
-        self._data = {}
-        self._revisions = {}
-        self._lock = threading.Lock()
-        self._barrier_key = None
-        self._barrier = None
-        self._barrier_passes_remaining = 0
-
-    def set(self, key, value, **kwargs):
-        with self._lock:
-            self._set_locked(key, value)
-        return True
-
-    def get(self, key):
-        with self._lock:
-            return self._data.get(key)
-
-    def exists(self, key):
-        with self._lock:
-            return 1 if key in self._data else 0
-
-    def pipeline(self, transaction=True):
-        return _FakeWatchPipeline(self)
-
-    def arm_barrier(self, key: str, parties: int):
-        self._barrier_key = key
-        self._barrier = threading.Barrier(parties)
-        self._barrier_passes_remaining = parties
-
-    def _claim_barrier(self, key):
-        with self._lock:
-            if key != self._barrier_key or self._barrier is None:
-                return None
-            if self._barrier_passes_remaining <= 0:
-                return None
-            self._barrier_passes_remaining -= 1
-            return self._barrier
-
-    def _set_locked(self, key, value):
-        self._data[key] = value
-        self._revisions[key] = self._revisions.get(key, 0) + 1
-
-
 class TestOrderApiGuards(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -155,7 +52,7 @@ class TestOrderApiGuards(unittest.TestCase):
         )
 
     def test_add_item_retries_after_watch_conflict(self):
-        fake_db = _FakeWatchRedis()
+        fake_db = FakeWatchRedis()
         order_id = "order-1"
         item_id = "item-1"
         fake_db.set(order_id, self._make_order_bytes())
@@ -174,7 +71,11 @@ class TestOrderApiGuards(unittest.TestCase):
                  "_send_get",
                  return_value=_FakeResponse(200, {"price": 5}),
              ), \
-             mock.patch.object(self.order_app, "_acquire_mutation_guard", return_value="lease"), \
+             mock.patch.object(
+                 self.order_app,
+                 "_acquire_mutation_guard",
+                 return_value=SimpleNamespace(ok=True, lease_id="lease", status_code=200, error=None),
+             ), \
              mock.patch.object(self.order_app, "_release_mutation_guard"):
             threads = [threading.Thread(target=_request_add_item) for _ in range(2)]
             for thread in threads:
@@ -201,7 +102,7 @@ class TestOrderApiGuards(unittest.TestCase):
         self.assertEqual(negative_response.status_code, 400)
 
     def test_add_item_rejects_paid_order(self):
-        fake_db = _FakeWatchRedis()
+        fake_db = FakeWatchRedis()
         order_id = "order-paid"
         fake_db.set(order_id, self._make_order_bytes(paid=True, items=[("item-1", 1)], total_cost=5))
 
@@ -226,7 +127,7 @@ class TestOrderApiGuards(unittest.TestCase):
         self.assertEqual(saved.total_cost, 5)
 
     def test_add_item_rejects_missing_order_before_guard_rpc(self):
-        fake_db = _FakeWatchRedis()
+        fake_db = FakeWatchRedis()
 
         with mock.patch.object(self.order_app, "db", fake_db), \
              mock.patch.object(
@@ -246,12 +147,9 @@ class TestOrderApiGuards(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
 
     def test_add_item_rejects_order_with_active_checkout_guard(self):
-        fake_db = _FakeWatchRedis()
+        fake_db = FakeWatchRedis()
         order_id = "order-active"
         fake_db.set(order_id, self._make_order_bytes())
-
-        def _blocked(_order_id):
-            self.order_app.abort(409, "Checkout already in progress")
 
         with mock.patch.object(self.order_app, "db", fake_db), \
              mock.patch.object(
@@ -259,7 +157,16 @@ class TestOrderApiGuards(unittest.TestCase):
                  "_send_get",
                  return_value=_FakeResponse(200, {"price": 5}),
              ), \
-             mock.patch.object(self.order_app, "_acquire_mutation_guard", side_effect=_blocked), \
+             mock.patch.object(
+                 self.order_app,
+                 "_acquire_mutation_guard",
+                 return_value=SimpleNamespace(
+                     ok=False,
+                     lease_id=None,
+                     status_code=409,
+                     error="Checkout already in progress",
+                 ),
+             ), \
              mock.patch.object(self.order_app, "_release_mutation_guard"):
             with self.order_app.app.test_client() as client:
                 response = client.post(f"/addItem/{order_id}/item-1/1")

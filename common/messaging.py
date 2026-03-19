@@ -18,7 +18,6 @@ Gunicorn prefork constraint:
   silently or raise exceptions. Use gunicorn's post_fork hook to start threads.
 """
 import logging
-import os
 import threading
 import time
 from typing import Callable, Optional
@@ -35,26 +34,12 @@ from common.constants import (
     ORDER_COMMANDS_DLQ,
     ORCHESTRATOR_COMMANDS_DLQ,
 )
+from common.env import get_positive_int_env
 
 logger = logging.getLogger(__name__)
 
 # Thread-local storage: each request thread owns its own pika connection.
 _thread_local = threading.local()
-
-
-def _get_positive_int_env(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        parsed = int(value)
-        if parsed > 0:
-            return parsed
-    except ValueError:
-        pass
-    logger.warning("Invalid %s=%r, using default=%d", name, value, default)
-    return default
-
 # ---------------------------------------------------------------------------
 # Queue topology
 # ---------------------------------------------------------------------------
@@ -210,7 +195,7 @@ def start_participant_consumer(
 def _run_participant_consumer(rabbitmq_url: str, queue: str, handler: Callable) -> None:
     """Consumer thread body. Reconnects on any error with exponential backoff."""
     backoff = 1
-    prefetch_count = _get_positive_int_env("PARTICIPANT_CONSUMER_PREFETCH_COUNT", 1)
+    prefetch_count = get_positive_int_env("PARTICIPANT_CONSUMER_PREFETCH_COUNT", 1, logger)
     while True:
         try:
             conn = pika.BlockingConnection(pika.URLParameters(rabbitmq_url))

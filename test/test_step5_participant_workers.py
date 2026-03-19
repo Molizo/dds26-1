@@ -163,6 +163,7 @@ class TestParticipantWorkerIntegration(LiveStackTestCase):
             (PAYMENT_COMMANDS_QUEUE, PAYMENT_COMMANDS_DLQ),
         ):
             with self.subTest(queue=queue_name):
+                wait_for_queue_consumers(queue_name, minimum=1, timeout_seconds=30.0)
                 purge_queue(queue_name)
                 purge_queue(dlq_name)
 

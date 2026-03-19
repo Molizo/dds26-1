@@ -146,12 +146,12 @@ class TestCheckoutFailureModes(unittest.TestCase):
             ) from exc
 
     def setUp(self):
-        _run_compose("start", "stock-service")
+        _run_compose("start", "order-service", "orchestrator-service", "stock-service", "payment-service")
         _wait_stock_route_ready()
         _purge_queue(STOCK_COMMANDS_QUEUE)
 
     def tearDown(self):
-        _run_compose("start", "stock-service")
+        _run_compose("start", "order-service", "orchestrator-service", "stock-service", "payment-service")
         _wait_stock_route_ready()
         _purge_queue(STOCK_COMMANDS_QUEUE)
 
@@ -236,7 +236,7 @@ class TestCheckoutFailureModes(unittest.TestCase):
             # Wait until both stock messages (hold + release) are queued while the stock
             # service is stopped. Then remove release and re-inject only hold, so the
             # next stock reply is guaranteed to be stale relative to release phase.
-            deadline = time.monotonic() + HOLD_TIMEOUT_SECONDS + 8.0
+            deadline = time.monotonic() + HOLD_TIMEOUT_SECONDS + 15.0
             queued_messages: list[dict] = []
             while time.monotonic() < deadline:
                 queued_messages = _peek_queue(STOCK_COMMANDS_QUEUE, count=20)

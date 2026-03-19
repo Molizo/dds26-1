@@ -31,7 +31,7 @@ from live_stack_utils import (
 
 class TestParticipantWorkerIntegration(LiveStackTestCase):
     def setUp(self):
-        for service_name in ("order-service", "stock-service", "payment-service"):
+        for service_name in ("order-service", "orchestrator-service", "stock-service", "payment-service"):
             # start is idempotent and cheaper than full restart for test setup
             run_compose("start", service_name)
             wait_gateway_ready()

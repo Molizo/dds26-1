@@ -30,9 +30,11 @@ VALID_PROTOCOLS = frozenset({PROTOCOL_SAGA, PROTOCOL_2PC})
 # Timing constants
 PARTICIPANT_REPLY_TIMEOUT = 10   # seconds to wait for a participant reply
 ACTIVE_TX_GUARD_TTL = 60         # seconds before an abandoned guard expires
+ORDER_MUTATION_GUARD_TTL = 15    # seconds before an abandoned order mutation guard expires
 PARTICIPANT_TX_TTL = 3600        # seconds before participant tx idempotency records expire (1 hour)
 RECOVERY_SCAN_INTERVAL = 30      # seconds between recovery worker scans
 RECOVERY_STALE_AGE = 15          # seconds before a non-terminal tx is eligible for recovery
+RECOVERY_LEADER_LOCK_TTL = 15    # seconds before the orchestrator recovery leader lease expires
 
 # RabbitMQ queue names
 STOCK_COMMANDS_QUEUE = "stock.commands"

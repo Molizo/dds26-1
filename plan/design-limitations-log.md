@@ -7,6 +7,24 @@ It should be updated whenever implementation reveals a new constraint, incorrect
 
 Use this log to avoid repeating known mistakes and to justify walking back earlier decisions when needed.
 
+## 2026-03-19 - A read-only orchestrator lock check is not enough to serialize order mutation against checkout
+
+- Limitation encountered:
+  - After moving the active checkout guard into orchestrator-owned Redis, a simple order-service `GET locked?` call before `addItem` leaves a race window where checkout can start after the read but before the order mutation commits.
+
+- Why the current design caused it:
+  - In Phase 1, `addItem` and checkout both observed the same Redis guard key locally from the order service.
+  - In Phase 2, the authoritative guard moves to a different service and datastore, so a read-only remote check is no longer atomic with the order write.
+
+- Impact:
+  - Consistency risk: an item can be added after checkout begins but before the order is marked paid, creating a stale checkout snapshot or a free-item bug.
+
+- Chosen mitigation or follow-up action:
+  - Add an orchestrator-owned short-lived mutation guard in orchestrator Redis.
+  - `addItem` acquires/releases that guard via internal orchestrator endpoints.
+  - Checkout acquires the active-tx guard only when no mutation guard exists.
+  - This keeps tx coordination state out of order Redis while preserving mutual exclusion between checkout and order mutation.
+
 ## 2026-03-11 - Live-stack transaction verification needs out-of-band observability
 
 - Limitation encountered:

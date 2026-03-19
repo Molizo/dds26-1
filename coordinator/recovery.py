@@ -10,11 +10,13 @@ This module is transport-agnostic and must not import Flask.
 import logging
 import threading
 import time
+import uuid
 from typing import Optional
 
 from common.constants import (
     ACTIVE_TX_GUARD_TTL,
     RECOVERY_SCAN_INTERVAL,
+    RECOVERY_LEADER_LOCK_TTL,
     RECOVERY_STALE_AGE,
     TERMINAL_STATUSES,
 )
@@ -41,6 +43,7 @@ class RecoveryWorker:
         self._stale_age_ms = max(0, int(stale_age_seconds)) * 1000
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._leader_id = f"recovery-{uuid.uuid4().hex}"
 
     def start(self) -> threading.Thread:
         """Start the background loop (startup scan + periodic scans)."""
@@ -66,12 +69,16 @@ class RecoveryWorker:
         self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
+        self._release_recovery_leader()
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
     def run_scan_once(self, reason: str = "periodic") -> int:
         """Run one recovery scan and return how many txs were resumed."""
+        if not self._acquire_recovery_leader():
+            return 0
+
         now_ms = int(time.time() * 1000)
         stale_before_ms = now_ms - self._stale_age_ms
         recovered = 0
@@ -219,6 +226,26 @@ class RecoveryWorker:
             fn(tx_id)
         except Exception:
             logger.exception("Failed to release recovery lock tx=%s", tx_id)
+
+    def _acquire_recovery_leader(self) -> bool:
+        """Only one orchestrator process should run scans at a time."""
+        fn = getattr(self._tx, "acquire_recovery_leader", None)
+        if fn is None:
+            return True
+        try:
+            return bool(fn(self._leader_id, RECOVERY_LEADER_LOCK_TTL))
+        except Exception:
+            logger.exception("Failed to acquire recovery leader lock owner=%s", self._leader_id)
+            return False
+
+    def _release_recovery_leader(self) -> None:
+        fn = getattr(self._tx, "release_recovery_leader", None)
+        if fn is None:
+            return
+        try:
+            fn(self._leader_id)
+        except Exception:
+            logger.exception("Failed to release recovery leader lock owner=%s", self._leader_id)
 
 
 _worker_lock = threading.Lock()

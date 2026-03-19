@@ -82,16 +82,17 @@ def rpc_request_bytes(
 
 
 def _on_reply(channel, method, properties, body: bytes) -> None:
-    channel.basic_ack(delivery_tag=method.delivery_tag)
     request_id = properties.correlation_id if properties else None
     if not request_id:
         logger.warning("Ignoring RPC reply without correlation id")
+        channel.basic_ack(delivery_tag=method.delivery_tag)
         return
 
     with _reply_lock:
         entry = _pending_replies.get(request_id)
         if entry is None:
             logger.debug("Ignoring stale RPC reply for request=%s", request_id)
-            return
-        entry.body = body
-        entry.event.set()
+        else:
+            entry.body = body
+            entry.event.set()
+    channel.basic_ack(delivery_tag=method.delivery_tag)

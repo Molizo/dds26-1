@@ -111,12 +111,11 @@ def init_reply_consumer(rabbitmq_url: str) -> threading.Thread:
 
 def _on_reply(channel, method, properties, body: bytes) -> None:
     """Handle one ParticipantReply from the reply queue."""
-    channel.basic_ack(delivery_tag=method.delivery_tag)
-
     try:
         reply = decode_reply(body)
     except Exception as exc:
         logger.error("Failed to decode reply: %s", exc)
+        channel.basic_ack(delivery_tag=method.delivery_tag)
         return
 
     with _correlation_lock:
@@ -124,8 +123,7 @@ def _on_reply(channel, method, properties, body: bytes) -> None:
         if entry is None:
             # Stale reply for a tx_id we're not waiting on (timeout already passed)
             logger.debug("Ignoring stale reply for tx=%s service=%s", reply.tx_id, reply.service)
-            return
-        if reply.command != entry.expected_command:
+        elif reply.command != entry.expected_command:
             logger.debug(
                 "Ignoring out-of-phase reply for tx=%s service=%s command=%s expected=%s",
                 reply.tx_id,
@@ -133,24 +131,23 @@ def _on_reply(channel, method, properties, body: bytes) -> None:
                 reply.command,
                 entry.expected_command,
             )
-            return
-        if reply.service not in entry.expected_services:
+        elif reply.service not in entry.expected_services:
             logger.debug(
                 "Ignoring unexpected-service reply for tx=%s service=%s command=%s",
                 reply.tx_id,
                 reply.service,
                 reply.command,
             )
-            return
-        if reply.service in entry.replied_services:
+        elif reply.service in entry.replied_services:
             logger.debug(
                 "Ignoring duplicate reply for tx=%s service=%s command=%s",
                 reply.tx_id,
                 reply.service,
                 reply.command,
             )
-            return
-        entry.replied_services.add(reply.service)
-        entry.replies.append(reply)
-        if entry.replied_services >= entry.expected_services:
-            entry.event.set()
+        else:
+            entry.replied_services.add(reply.service)
+            entry.replies.append(reply)
+            if entry.replied_services >= entry.expected_services:
+                entry.event.set()
+    channel.basic_ack(delivery_tag=method.delivery_tag)

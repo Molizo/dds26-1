@@ -2,7 +2,8 @@
 import os
 import sys
 import unittest
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _orchestrator_dir = os.path.join(_repo_root, "orchestrator")
@@ -24,6 +25,7 @@ from common.constants import (
 )
 from common.models import encode_reply
 from common.result import CheckoutResult
+from common.worker_support import handle_internal_rpc_delivery, handle_participant_delivery
 from coordinator.models import make_tx
 from helpers.coordinator_doubles import MockOrderPort, MockTxStore, make_snapshot, stock_reply
 from runtime_service import OrchestratorRuntime
@@ -40,6 +42,38 @@ class TestReplyCorrelationFiltering(unittest.TestCase):
         import coordinator.messaging as messaging
         with messaging._correlation_lock:
             messaging._correlation_map.clear()
+
+    def test_correct_phase_reply_records_before_ack(self):
+        import coordinator.messaging as messaging
+        from coordinator.messaging import _on_reply, register_pending
+
+        register_pending(
+            "tx-ack",
+            expected_command=CMD_COMMIT,
+            expected_services=frozenset({SVC_STOCK}),
+        )
+
+        def assert_recorded_before_ack(*, delivery_tag):
+            self.assertEqual(delivery_tag, 1)
+            with messaging._correlation_lock:
+                entry = messaging._correlation_map.get("tx-ack")
+                self.assertIsNotNone(entry)
+                self.assertTrue(entry.event.is_set())
+                self.assertEqual(len(entry.replies), 1)
+
+        mock_channel = MagicMock()
+        mock_channel.basic_ack.side_effect = assert_recorded_before_ack
+        mock_method = MagicMock()
+        mock_method.delivery_tag = 1
+
+        _on_reply(
+            mock_channel,
+            mock_method,
+            MagicMock(),
+            encode_reply(stock_reply("tx-ack", ok=True, command=CMD_COMMIT)),
+        )
+
+        mock_channel.basic_ack.assert_called_once_with(delivery_tag=1)
 
     def test_out_of_phase_reply_is_ignored(self):
         import coordinator.messaging as messaging
@@ -180,6 +214,38 @@ class TestReplyCorrelationFiltering(unittest.TestCase):
 
 
 class TestOrchestratorRuntime(unittest.TestCase):
+    def test_execute_checkout_acquires_guard_before_order_read(self):
+        call_order = []
+
+        class _TrackingTxStore(MockTxStore):
+            def acquire_active_tx_guard(self, order_id, tx_id, ttl):
+                call_order.append("guard")
+                return super().acquire_active_tx_guard(order_id, tx_id, ttl)
+
+        class _TrackingOrderPort(MockOrderPort):
+            def read_order(self, order_id):
+                call_order.append("read")
+                return super().read_order(order_id)
+
+        order_port = _TrackingOrderPort(snapshot=make_snapshot())
+        tx_store = _TrackingTxStore()
+        coordinator = MagicMock()
+        coordinator.execute_checkout.return_value = CheckoutResult.ok()
+        runtime = OrchestratorRuntime(
+            db=MagicMock(),
+            rabbitmq_url="amqp://test",
+            checkout_protocol=PROTOCOL_SAGA,
+            logger=MagicMock(),
+            order_port=order_port,
+            tx_store_adapter=tx_store,
+            coordinator=coordinator,
+        )
+
+        result = runtime.execute_checkout("order-1", "tx-1")
+
+        self.assertTrue(result.success)
+        self.assertEqual(call_order[:2], ["guard", "read"])
+
     def test_execute_checkout_reads_order_once_and_passes_snapshot(self):
         order_port = MockOrderPort(snapshot=make_snapshot())
         tx_store = MockTxStore()
@@ -220,6 +286,7 @@ class TestOrchestratorRuntime(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.status_code, 400)
         self.assertEqual(order_port.read_order_calls, ["order-404"])
+        self.assertIsNone(tx_store.get_active_tx_guard("order-404"))
         coordinator.execute_checkout.assert_not_called()
 
     def test_execute_checkout_short_circuits_paid_order(self):
@@ -241,6 +308,7 @@ class TestOrchestratorRuntime(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertTrue(result.already_paid)
         self.assertEqual(order_port.read_order_calls, ["order-1"])
+        self.assertIsNone(tx_store.get_active_tx_guard("order-1"))
         coordinator.execute_checkout.assert_not_called()
 
     def test_execute_checkout_existing_tx_reuses_result_without_read(self):
@@ -272,6 +340,152 @@ class TestOrchestratorRuntime(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(order_port.read_order_calls, [])
         coordinator.execute_checkout.assert_not_called()
+
+    def test_execute_checkout_clears_guard_when_order_read_fails(self):
+        class _FailingOrderPort:
+            def __init__(self):
+                self.read_order_calls = []
+
+            def read_order(self, order_id):
+                self.read_order_calls.append(order_id)
+                raise RuntimeError("order down")
+
+        order_port = _FailingOrderPort()
+        tx_store = MockTxStore()
+        coordinator = MagicMock()
+        logger = MagicMock()
+        runtime = OrchestratorRuntime(
+            db=MagicMock(),
+            rabbitmq_url="amqp://test",
+            checkout_protocol=PROTOCOL_SAGA,
+            logger=logger,
+            order_port=order_port,
+            tx_store_adapter=tx_store,
+            coordinator=coordinator,
+        )
+
+        result = runtime.execute_checkout("order-err", "tx-err")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "order_read_failed")
+        self.assertEqual(order_port.read_order_calls, ["order-err"])
+        self.assertIsNone(tx_store.get_active_tx_guard("order-err"))
+        coordinator.execute_checkout.assert_not_called()
+        logger.exception.assert_called_once()
+
+
+class TestRpcReplyConsumer(unittest.TestCase):
+    def setUp(self):
+        import common.rpc as rpc
+        with rpc._reply_lock:
+            rpc._pending_replies.clear()
+
+    def tearDown(self):
+        import common.rpc as rpc
+        with rpc._reply_lock:
+            rpc._pending_replies.clear()
+
+    def test_on_reply_records_body_before_ack(self):
+        import common.rpc as rpc
+
+        entry = rpc._PendingReply()
+        with rpc._reply_lock:
+            rpc._pending_replies["req-1"] = entry
+
+        def assert_recorded_before_ack(*, delivery_tag):
+            self.assertEqual(delivery_tag, 1)
+            self.assertEqual(entry.body, b"reply-body")
+            self.assertTrue(entry.event.is_set())
+
+        mock_channel = MagicMock()
+        mock_channel.basic_ack.side_effect = assert_recorded_before_ack
+        mock_method = MagicMock()
+        mock_method.delivery_tag = 1
+        properties = SimpleNamespace(correlation_id="req-1")
+
+        rpc._on_reply(mock_channel, mock_method, properties, b"reply-body")
+
+        mock_channel.basic_ack.assert_called_once_with(delivery_tag=1)
+
+
+class TestWorkerSupport(unittest.TestCase):
+    def test_handle_internal_rpc_delivery_nacks_when_publish_fails(self):
+        channel = MagicMock()
+        method = SimpleNamespace(delivery_tag=7)
+        properties = SimpleNamespace(reply_to="rpc.replies", correlation_id="req-1")
+        cmd = SimpleNamespace(request_id="req-1")
+        reply = object()
+
+        with patch("common.worker_support.publish_message", side_effect=RuntimeError("broker down")):
+            handle_internal_rpc_delivery(
+                channel=channel,
+                method=method,
+                properties=properties,
+                body=b"cmd",
+                rabbitmq_url="amqp://test",
+                service_name="orchestrator",
+                decode_command=lambda body: cmd,
+                dispatch=lambda decoded: reply,
+                encode_reply=lambda encoded_reply: b"reply",
+                logger=MagicMock(),
+            )
+
+        channel.basic_ack.assert_not_called()
+        channel.basic_nack.assert_called_once_with(delivery_tag=7, requeue=True)
+
+    def test_handle_internal_rpc_delivery_publishes_before_ack(self):
+        channel = MagicMock()
+        method = SimpleNamespace(delivery_tag=8)
+        properties = SimpleNamespace(reply_to="rpc.replies", correlation_id="req-2")
+        events = []
+
+        def publish_side_effect(*args, **kwargs):
+            events.append("publish")
+            channel.basic_ack.assert_not_called()
+
+        def ack_side_effect(*, delivery_tag):
+            self.assertEqual(delivery_tag, 8)
+            events.append("ack")
+
+        channel.basic_ack.side_effect = ack_side_effect
+
+        with patch("common.worker_support.publish_message", side_effect=publish_side_effect):
+            handle_internal_rpc_delivery(
+                channel=channel,
+                method=method,
+                properties=properties,
+                body=b"cmd",
+                rabbitmq_url="amqp://test",
+                service_name="orchestrator",
+                decode_command=lambda body: SimpleNamespace(request_id="req-2"),
+                dispatch=lambda decoded: object(),
+                encode_reply=lambda encoded_reply: b"reply",
+                logger=MagicMock(),
+            )
+
+        self.assertEqual(events, ["publish", "ack"])
+        channel.basic_nack.assert_not_called()
+
+    def test_handle_participant_delivery_nacks_when_publish_fails(self):
+        channel = MagicMock()
+        method = SimpleNamespace(delivery_tag=9)
+        cmd = SimpleNamespace(tx_id="tx-1", command="hold", reply_to="coordinator.replies")
+
+        with patch("common.worker_support.publish_reply", side_effect=RuntimeError("broker down")):
+            handle_participant_delivery(
+                channel=channel,
+                method=method,
+                body=b"cmd",
+                rabbitmq_url="amqp://test",
+                service_name="stock",
+                decode_command=lambda body: cmd,
+                dispatch=lambda decoded: object(),
+                encode_reply=lambda encoded_reply: b"reply",
+                logger=MagicMock(),
+            )
+
+        channel.basic_ack.assert_not_called()
+        channel.basic_nack.assert_called_once_with(delivery_tag=9, requeue=True)
 
 
 if __name__ == "__main__":

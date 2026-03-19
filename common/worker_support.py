@@ -37,8 +37,6 @@ def handle_internal_rpc_delivery(
         return
 
     reply = dispatch(cmd)
-    channel.basic_ack(delivery_tag=method.delivery_tag)
-
     try:
         publish_message(
             rabbitmq_url,
@@ -46,13 +44,15 @@ def handle_internal_rpc_delivery(
             encode_reply(reply),
             correlation_id=correlation_id,
         )
+        channel.basic_ack(delivery_tag=method.delivery_tag)
     except Exception as exc:
         logger.error(
-            "Failed to publish %s reply request=%s: %s",
+            "Failed processing %s reply request=%s: %s",
             service_name,
             getattr(cmd, "request_id", "?"),
             exc,
         )
+        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
 
 def handle_participant_delivery(
@@ -81,14 +81,14 @@ def handle_participant_delivery(
         getattr(cmd, "command", "?"),
     )
     reply = dispatch(cmd)
-    channel.basic_ack(delivery_tag=method.delivery_tag)
-
     try:
         publish_reply(rabbitmq_url, getattr(cmd, "reply_to", ""), encode_reply(reply))
+        channel.basic_ack(delivery_tag=method.delivery_tag)
     except Exception as exc:
         logger.error(
-            "Failed to publish %s reply tx=%s: %s",
+            "Failed processing %s reply tx=%s: %s",
             service_name,
             getattr(cmd, "tx_id", "?"),
             exc,
         )
+        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)

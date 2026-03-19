@@ -129,16 +129,6 @@ class OrchestratorRuntime:
         if existing_tx is not None:
             return _result_for_existing_tx(existing_tx)
 
-        try:
-            snapshot = self.order_port.read_order(order_id)
-        except Exception:
-            self._logger.exception("Order snapshot lookup failed order=%s tx=%s", order_id, tx_id)
-            return CheckoutResult.fail("order_read_failed")
-        if snapshot is None:
-            return CheckoutResult.fail(f"Order: {order_id} not found!", code=400)
-        if snapshot.paid:
-            return CheckoutResult.paid()
-
         acquired = self.tx_store.acquire_active_tx_guard(order_id, tx_id, ACTIVE_TX_GUARD_TTL)
         if not acquired:
             existing_tx_id = self.tx_store.get_active_tx_guard(order_id)
@@ -147,11 +137,24 @@ class OrchestratorRuntime:
             if not acquired:
                 return CheckoutResult.conflict()
 
+        try:
+            snapshot = self.order_port.read_order(order_id)
+        except Exception:
+            self._logger.exception("Order snapshot lookup failed order=%s tx=%s", order_id, tx_id)
+            self._clear_active_tx_guard_if_owned(order_id, tx_id)
+            return CheckoutResult.fail("order_read_failed")
+        if snapshot is None:
+            self._clear_active_tx_guard_if_owned(order_id, tx_id)
+            return CheckoutResult.fail(f"Order: {order_id} not found!", code=400)
+        if snapshot.paid:
+            self._clear_active_tx_guard_if_owned(order_id, tx_id)
+            return CheckoutResult.paid()
+
         result = self.coordinator.execute_checkout(snapshot, self._checkout_protocol, tx_id)
 
         tx_after = self.tx_store.get_tx(tx_id)
         if tx_after is not None and tx_after.status in TERMINAL_STATUSES:
-            self.tx_store.clear_active_tx_guard_if_owned(order_id, tx_id)
+            self._clear_active_tx_guard_if_owned(order_id, tx_id)
 
         return result
 
@@ -257,7 +260,18 @@ class OrchestratorRuntime:
         existing_tx = self.tx_store.get_tx(tx_id)
         if existing_tx is None or existing_tx.status not in TERMINAL_STATUSES:
             return False
-        return self.tx_store.clear_active_tx_guard_if_owned(order_id, tx_id)
+        return self._clear_active_tx_guard_if_owned(order_id, tx_id)
+
+    def _clear_active_tx_guard_if_owned(self, order_id: str, tx_id: str) -> bool:
+        try:
+            return bool(self.tx_store.clear_active_tx_guard_if_owned(order_id, tx_id))
+        except Exception:
+            self._logger.exception(
+                "Failed clearing active tx guard order=%s tx=%s",
+                order_id,
+                tx_id,
+            )
+            return False
 
 
 def _result_for_existing_tx(existing_tx) -> CheckoutResult:

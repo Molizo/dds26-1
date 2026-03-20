@@ -4,7 +4,7 @@ import uuid
 import redis
 from msgspec import msgpack
 
-from store import AddItemResult, OrderValue, add_item_to_order, get_order
+from store import AddItemResult, OrderLookupResult, OrderValue, add_item_to_order, get_order, get_order_result
 
 
 class OrderService:
@@ -42,6 +42,9 @@ class OrderService:
 
     def find_order(self, order_id: str) -> OrderValue | None:
         return get_order(self._db, order_id)
+
+    def find_order_result(self, order_id: str) -> OrderLookupResult:
+        return get_order_result(self._db, order_id)
 
     def add_item(self, order_id: str, item_id: str, quantity: int, price: int) -> AddItemResult:
         return add_item_to_order(

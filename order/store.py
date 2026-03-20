@@ -36,16 +36,27 @@ class AddItemResult:
     total_cost: int | None = None
 
 
-def get_order(db: redis.Redis, order_id: str) -> Optional[OrderValue]:
-    """Return the raw OrderValue or None if not found."""
+@dataclass(frozen=True)
+class OrderLookupResult:
+    status: str
+    order: "OrderValue | None" = None
+
+
+def get_order_result(db: redis.Redis, order_id: str) -> OrderLookupResult:
+    """Return the raw OrderValue together with not-found vs db-error status."""
     try:
         raw = db.get(order_id)
     except redis.exceptions.RedisError as exc:
         logger.error("Redis error reading order %s: %s", order_id, exc)
-        return None
+        return OrderLookupResult(status="db_error")
     if raw is None:
-        return None
-    return _order_decoder.decode(raw)
+        return OrderLookupResult(status="not_found")
+    return OrderLookupResult(status="ok", order=_order_decoder.decode(raw))
+
+
+def get_order(db: redis.Redis, order_id: str) -> Optional[OrderValue]:
+    """Return the raw OrderValue or None if not found."""
+    return get_order_result(db, order_id).order
 
 
 def read_order_snapshot(db: redis.Redis, order_id: str) -> Optional[OrderSnapshot]:

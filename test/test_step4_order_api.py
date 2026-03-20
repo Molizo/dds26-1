@@ -1,4 +1,5 @@
 import os
+import redis
 import sys
 import threading
 import unittest
@@ -146,6 +147,31 @@ class TestOrderApiGuards(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
 
+    def test_add_item_returns_db_error_when_order_lookup_fails(self):
+        class _FailingGetRedis(FakeWatchRedis):
+            def get(self, key):
+                raise redis.exceptions.RedisError("boom")
+
+        fake_db = _FailingGetRedis()
+
+        with mock.patch.object(self.order_app, "db", fake_db), \
+             mock.patch.object(
+                 self.order_app,
+                 "_send_get",
+                 return_value=_FakeResponse(200, {"price": 5}),
+             ), \
+             mock.patch.object(
+                 self.order_app,
+                 "_acquire_mutation_guard",
+                 side_effect=AssertionError("should not acquire guard"),
+             ), \
+             mock.patch.object(self.order_app, "_release_mutation_guard"):
+            with self.order_app.app.test_client() as client:
+                response = client.post("/addItem/order-db-down/item-1/1")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(b"DB error", response.data)
+
     def test_add_item_rejects_order_with_active_checkout_guard(self):
         fake_db = FakeWatchRedis()
         order_id = "order-active"
@@ -206,7 +232,21 @@ class TestOrderApiGuards(unittest.TestCase):
                 response = client.post("/checkout/order-1")
                 statuses.append(response.status_code)
 
-        with mock.patch.object(self.order_app, "_call_orchestrator", side_effect=_fake_checkout_call):
+        with mock.patch.object(
+            self.order_app,
+            "_lookup_order",
+            return_value=self.order_app.OrderLookupResult(
+                status="ok",
+                order=self.order_app.OrderValue(
+                    paid=False,
+                    items=[],
+                    user_id="user-1",
+                    total_cost=0,
+                ),
+            ),
+        ), mock.patch.object(self.order_app, "db") as mock_db, \
+             mock.patch.object(self.order_app, "_call_orchestrator", side_effect=_fake_checkout_call):
+            mock_db.exists.return_value = 0
             threads = [threading.Thread(target=_run_checkout) for _ in range(8)]
             for thread in threads:
                 thread.start()
@@ -215,6 +255,24 @@ class TestOrderApiGuards(unittest.TestCase):
 
         self.assertEqual(statuses.count(200), 1)
         self.assertEqual(statuses.count(409), 7)
+
+    def test_checkout_short_circuits_locally_when_paid_marker_exists(self):
+        fake_db = FakeWatchRedis()
+        order_id = "order-paid"
+        fake_db.set(order_id, self._make_order_bytes(paid=False, items=[("item-1", 1)], total_cost=5))
+        fake_db.set(f"order_paid:{order_id}", b"1")
+
+        with mock.patch.object(self.order_app, "db", fake_db), \
+             mock.patch.object(
+                 self.order_app,
+                 "_call_orchestrator",
+                 side_effect=AssertionError("should not call orchestrator"),
+             ):
+            with self.order_app.app.test_client() as client:
+                response = client.post(f"/checkout/{order_id}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, b"Checkout successful")
 
 
 if __name__ == "__main__":

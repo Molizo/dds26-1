@@ -373,6 +373,35 @@ class TestOrchestratorRuntime(unittest.TestCase):
         coordinator.execute_checkout.assert_not_called()
         logger.exception.assert_called_once()
 
+    def test_acquire_mutation_guard_normalizes_transient_busy_to_retryable_reason(self):
+        class _BusyTxStore(MockTxStore):
+            def __init__(self):
+                super().__init__()
+                self._attempts = 0
+
+            def acquire_mutation_guard(self, order_id, lease_id, ttl):
+                self._attempts += 1
+                return False
+
+            def get_mutation_guard(self, order_id):
+                return None
+
+        runtime = OrchestratorRuntime(
+            db=MagicMock(),
+            rabbitmq_url="amqp://test",
+            checkout_protocol=PROTOCOL_SAGA,
+            logger=MagicMock(),
+            order_port=MockOrderPort(snapshot=make_snapshot()),
+            tx_store_adapter=_BusyTxStore(),
+            coordinator=MagicMock(),
+        )
+
+        acquired, reason, status_code = runtime.acquire_mutation_guard("order-1", "lease-1")
+
+        self.assertFalse(acquired)
+        self.assertEqual(reason, "mutation_in_progress")
+        self.assertEqual(status_code, 409)
+
 
 class TestRpcReplyConsumer(unittest.TestCase):
     def setUp(self):
@@ -406,6 +435,35 @@ class TestRpcReplyConsumer(unittest.TestCase):
         rpc._on_reply(mock_channel, mock_method, properties, b"reply-body")
 
         mock_channel.basic_ack.assert_called_once_with(delivery_tag=1)
+
+
+class TestReplyConsumerSetup(unittest.TestCase):
+    def test_reply_consumer_declares_non_exclusive_queue_that_survives_reconnects(self):
+        import common.amqp_consumers as consumers
+
+        channel = MagicMock()
+        connection = MagicMock()
+        connection.channel.return_value = channel
+        channel.start_consuming.side_effect = RuntimeError("stop")
+        logger = MagicMock()
+
+        with patch("common.amqp_consumers.pika.BlockingConnection", return_value=connection), \
+             patch("common.amqp_consumers.time.sleep", side_effect=StopIteration):
+            with self.assertRaises(StopIteration):
+                consumers._run_exclusive_reply_consumer(
+                    "amqp://test",
+                    "rpc.replies.test",
+                    10,
+                    MagicMock(),
+                    logger,
+                )
+
+        channel.queue_declare.assert_called_once_with(
+            queue="rpc.replies.test",
+            exclusive=False,
+            auto_delete=False,
+            arguments={"x-expires": consumers.REPLY_QUEUE_EXPIRES_MS},
+        )
 
 
 class TestWorkerSupport(unittest.TestCase):

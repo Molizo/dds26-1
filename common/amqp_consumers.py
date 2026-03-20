@@ -7,6 +7,8 @@ from collections.abc import Callable
 
 import pika
 
+REPLY_QUEUE_EXPIRES_MS = 60 * 60 * 1000
+
 
 def start_exclusive_reply_consumer(
     rabbitmq_url: str,
@@ -41,15 +43,20 @@ def _run_exclusive_reply_consumer(
         try:
             conn = pika.BlockingConnection(pika.URLParameters(rabbitmq_url))
             channel = conn.channel()
-            channel.queue_declare(queue=queue_name, exclusive=True, auto_delete=True)
+            channel.queue_declare(
+                queue=queue_name,
+                exclusive=False,
+                auto_delete=False,
+                arguments={"x-expires": REPLY_QUEUE_EXPIRES_MS},
+            )
             channel.basic_qos(prefetch_count=prefetch_count)
             channel.basic_consume(queue=queue_name, on_message_callback=on_message_callback)
-            logger.info("Exclusive reply consumer ready on queue=%s", queue_name)
+            logger.info("Reply consumer ready on queue=%s", queue_name)
             backoff = 1
             channel.start_consuming()
         except Exception as exc:
             logger.error(
-                "Exclusive reply consumer error on queue=%s: %s; reconnecting in %ds",
+                "Reply consumer error on queue=%s: %s; reconnecting in %ds",
                 queue_name,
                 exc,
                 backoff,

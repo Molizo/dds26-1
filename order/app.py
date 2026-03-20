@@ -15,7 +15,7 @@ from common.constants import (
 from common.models import InternalReply
 import domain_service
 from orchestrator_client import MutationGuardAcquireResult, OrchestratorClient
-from store import OrderValue
+from store import OrderLookupResult, OrderValue
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -70,10 +70,16 @@ def _get_orchestrator_client() -> OrchestratorClient:
 
 
 def _get_order_or_abort(order_id: str) -> OrderValue:
-    order = _get_order_service().find_order(order_id)
-    if order is None:
+    result = _get_order_service().find_order_result(order_id)
+    if result.status == "db_error":
+        abort(400, DB_ERROR_STR)
+    if result.order is None:
         abort(400, f"Order: {order_id} not found!")
-    return order
+    return result.order
+
+
+def _lookup_order(order_id: str) -> OrderLookupResult:
+    return _get_order_service().find_order_result(order_id)
 
 
 def _require_positive_int(value: int | str, field_name: str) -> int:
@@ -168,7 +174,10 @@ def find_order(order_id: str):
 def _precheck_order_for_add_item(order_id: str) -> tuple[bool, int | None, str | None]:
     order_paid_key = f"order_paid:{order_id}"
     try:
-        order = _get_order_service().find_order(order_id)
+        lookup = _lookup_order(order_id)
+        if lookup.status == "db_error":
+            return False, 400, DB_ERROR_STR
+        order = lookup.order
         if order is None:
             return False, 400, f"Order: {order_id} not found!"
         if order.paid or db.exists(order_paid_key) == 1:
@@ -215,6 +224,19 @@ def add_item(order_id: str, item_id: str, quantity: int):
 
 @app.post("/checkout/<order_id>")
 def checkout(order_id: str):
+    order_paid_key = f"order_paid:{order_id}"
+    try:
+        lookup = _lookup_order(order_id)
+        if lookup.status == "db_error":
+            abort(400, DB_ERROR_STR)
+        order = lookup.order
+        if order is None:
+            abort(400, f"Order: {order_id} not found!")
+        if order.paid or db.exists(order_paid_key) == 1:
+            return Response("Checkout successful", status=200)
+    except redis.exceptions.RedisError:
+        abort(400, DB_ERROR_STR)
+
     tx_id = str(uuid.uuid4())
     try:
         reply = _call_orchestrator(
@@ -231,7 +253,7 @@ def checkout(order_id: str):
         abort(400, "Checkout result unavailable")
     if reply.ok:
         return Response("Checkout successful", status=200)
-    abort(reply.status_code, reply.error or "Checkout failed")
+    abort(reply.status_code or 400, reply.error or "Checkout failed")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """Coordinator-side RabbitMQ messaging: reply queue consumer and correlation.
 
 Each gunicorn worker process creates:
-1. An exclusive auto-delete reply queue (coordinator.replies.{uuid})
+1. A per-process reply queue (coordinator.replies.{uuid})
 2. A background consumer thread that reads replies and signals waiting threads
 
 Request threads use register_pending() before publishing commands, then

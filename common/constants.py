@@ -43,7 +43,7 @@ ORDER_MUTATION_GUARD_TTL = 15    # seconds before an abandoned order mutation gu
 PARTICIPANT_TX_TTL = 3600        # seconds before participant tx idempotency records expire (1 hour)
 RECOVERY_SCAN_INTERVAL = 30      # seconds between recovery worker scans
 RECOVERY_STALE_AGE = 15          # seconds before a non-terminal tx is eligible for recovery
-RECOVERY_LEADER_LOCK_TTL = 15    # seconds before the orchestrator recovery leader lease expires
+RECOVERY_LEADER_LOCK_TTL = 35    # seconds before the orchestrator recovery leader lease expires
 
 # RabbitMQ queue names
 STOCK_COMMANDS_QUEUE = "stock.commands"

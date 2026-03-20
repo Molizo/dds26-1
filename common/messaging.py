@@ -7,7 +7,7 @@ Thread-safety model:
 - Participant consumer: one dedicated background thread per process with its
   own connection, consuming from stock.commands or payment.commands.
 - Reply consumer (coordinator): one dedicated background thread per process
-  consuming from an exclusive auto-delete reply queue. Added in Step 2.
+  consuming from a per-process reply queue that survives reconnects. Added in Step 2.
 - Correlation map: a shared {tx_id → (Event, result_slot)} dict protected by
   a threading.Lock. Request threads register before publishing; consumer thread
   signals. Added in Step 2.

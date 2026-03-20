@@ -10,6 +10,8 @@ if _repo_root not in sys.path:
 
 from common.constants import (
     PROTOCOL_SAGA,
+    RECOVERY_LEADER_LOCK_TTL,
+    RECOVERY_SCAN_INTERVAL,
     STATUS_ABORTED,
     STATUS_COMPLETED,
     STATUS_FAILED_NEEDS_RECOVERY,
@@ -114,6 +116,8 @@ def _make_stale_tx(
 
 
 class TestRecoveryWorker(unittest.TestCase):
+    def test_recovery_leader_lease_outlasts_scan_interval(self):
+        self.assertGreaterEqual(RECOVERY_LEADER_LOCK_TTL, RECOVERY_SCAN_INTERVAL)
 
     def test_startup_scan_resumes_stale_tx_and_clears_guard_on_terminal(self):
         tx_store = _MockTxStore()

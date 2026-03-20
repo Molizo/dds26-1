@@ -7,6 +7,25 @@ It should be updated whenever implementation reveals a new constraint, incorrect
 
 Use this log to avoid repeating known mistakes and to justify walking back earlier decisions when needed.
 
+## 2026-03-20 - Internal RPC transport must not erase stable local outcomes or tie reply durability to one consumer connection
+
+- Limitation encountered:
+  - Phase 2 extraction routed every checkout through orchestrator RPC, including already-paid orders that the order service can answer locally and idempotently.
+  - Per-process RPC reply queues were declared as exclusive auto-delete queues, so a RabbitMQ connection drop deleted the queue and could lose in-flight replies for already-executed work.
+
+- Why the current design caused it:
+  - The extraction optimized for one orchestration path and treated transport uniformity as more important than preserving owner-local fast paths.
+  - Reply-queue lifecycle was coupled to one consumer connection instead of the process-level request/reply contract.
+
+- Impact:
+  - Reliability risk: already-paid checkout retries could return transport-driven `4xx` failures instead of stable `200` responses.
+  - Availability risk: reply-path reconnects could turn successful side effects into caller timeouts and false failures.
+
+- Chosen mitigation or follow-up action:
+  - Keep a local already-paid checkout short-circuit in `order-service` before orchestrator RPC.
+  - Use per-process reply queues that survive reconnects and expire later, instead of exclusive auto-delete queues.
+  - Keep the recovery leader lease longer than the scan interval so reconnect/recovery coordination remains conservative.
+
 ## 2026-03-19 - Stable service-dir entrypoints still diverge from repo-root unit-test imports
 
 - Limitation encountered:

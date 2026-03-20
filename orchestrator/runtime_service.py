@@ -185,7 +185,7 @@ class OrchestratorRuntime:
             return False, "checkout_in_progress", 409
         if self.tx_store.get_mutation_guard(order_id):
             return False, "mutation_in_progress", 409
-        return False, "busy", 409
+        return False, "mutation_in_progress", 409
 
     def release_mutation_guard(self, order_id: str, lease_id: str) -> bool:
         try:

@@ -73,7 +73,7 @@ class OrchestratorClient:
                 continue
             if reply.ok and reply.status_code == 200:
                 return MutationGuardAcquireResult(True, lease_id, 200, None)
-            if reply.status_code == 409 and reply.reason == "mutation_in_progress":
+            if reply.status_code == 409 and reply.reason in {"mutation_in_progress", "busy"}:
                 time.sleep(self._guard_retry_delay_seconds)
                 continue
             if reply.status_code == 409 and reply.reason == "checkout_in_progress":

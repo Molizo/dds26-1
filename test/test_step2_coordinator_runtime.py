@@ -23,7 +23,7 @@ from common.constants import (
     SVC_STOCK,
     TERMINAL_STATUSES,
 )
-from common.models import encode_reply
+from common.models import decode_internal_reply, decode_reply, encode_internal_reply, encode_reply
 from common.result import CheckoutResult
 from common.worker_support import handle_internal_rpc_delivery, handle_participant_delivery
 from coordinator.models import make_tx
@@ -524,6 +524,39 @@ class TestWorkerSupport(unittest.TestCase):
         self.assertEqual(events, ["publish", "ack"])
         channel.basic_nack.assert_not_called()
 
+    def test_handle_internal_rpc_delivery_replies_when_dispatch_fails(self):
+        channel = MagicMock()
+        method = SimpleNamespace(delivery_tag=10)
+        properties = SimpleNamespace(reply_to="rpc.replies", correlation_id="req-3")
+        published = {}
+
+        def publish_side_effect(_url, routing_key, body, *, correlation_id=None):
+            published["routing_key"] = routing_key
+            published["correlation_id"] = correlation_id
+            published["reply"] = decode_internal_reply(body)
+
+        with patch("common.worker_support.publish_message", side_effect=publish_side_effect):
+            handle_internal_rpc_delivery(
+                channel=channel,
+                method=method,
+                properties=properties,
+                body=b"cmd",
+                rabbitmq_url="amqp://test",
+                service_name="orchestrator",
+                decode_command=lambda body: SimpleNamespace(request_id="req-3", command="checkout"),
+                dispatch=lambda decoded: (_ for _ in ()).throw(RuntimeError("boom")),
+                encode_reply=lambda reply: encode_internal_reply(reply),
+                logger=MagicMock(),
+            )
+
+        self.assertEqual(published["routing_key"], "rpc.replies")
+        self.assertEqual(published["correlation_id"], "req-3")
+        self.assertFalse(published["reply"].ok)
+        self.assertEqual(published["reply"].error, "internal_error")
+        self.assertEqual(published["reply"].status_code, 400)
+        channel.basic_ack.assert_called_once_with(delivery_tag=10)
+        channel.basic_nack.assert_not_called()
+
     def test_handle_participant_delivery_nacks_when_publish_fails(self):
         channel = MagicMock()
         method = SimpleNamespace(delivery_tag=9)
@@ -544,6 +577,41 @@ class TestWorkerSupport(unittest.TestCase):
 
         channel.basic_ack.assert_not_called()
         channel.basic_nack.assert_called_once_with(delivery_tag=9, requeue=True)
+
+    def test_handle_participant_delivery_replies_when_dispatch_fails(self):
+        channel = MagicMock()
+        method = SimpleNamespace(delivery_tag=11)
+        published = {}
+
+        def publish_side_effect(_url, reply_to, body):
+            published["reply_to"] = reply_to
+            published["reply"] = decode_reply(body)
+
+        with patch("common.worker_support.publish_reply", side_effect=publish_side_effect):
+            handle_participant_delivery(
+                channel=channel,
+                method=method,
+                body=b"cmd",
+                rabbitmq_url="amqp://test",
+                service_name="stock",
+                decode_command=lambda body: SimpleNamespace(
+                    tx_id="tx-2",
+                    command="hold",
+                    reply_to="coordinator.replies",
+                ),
+                dispatch=lambda decoded: (_ for _ in ()).throw(RuntimeError("boom")),
+                encode_reply=lambda reply: encode_reply(reply),
+                logger=MagicMock(),
+            )
+
+        self.assertEqual(published["reply_to"], "coordinator.replies")
+        self.assertEqual(published["reply"].tx_id, "tx-2")
+        self.assertEqual(published["reply"].service, "stock")
+        self.assertEqual(published["reply"].command, "hold")
+        self.assertFalse(published["reply"].ok)
+        self.assertEqual(published["reply"].error, "internal_error")
+        channel.basic_ack.assert_called_once_with(delivery_tag=11)
+        channel.basic_nack.assert_not_called()
 
 
 if __name__ == "__main__":

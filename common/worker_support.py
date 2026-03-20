@@ -3,6 +3,27 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from common.messaging import publish_message, publish_reply
+from common.models import InternalReply, ParticipantReply
+
+
+def _internal_dispatch_failure_reply(cmd: object) -> InternalReply:
+    return InternalReply(
+        request_id=getattr(cmd, "request_id", ""),
+        command=getattr(cmd, "command", "unknown"),
+        ok=False,
+        error="internal_error",
+        status_code=400,
+    )
+
+
+def _participant_dispatch_failure_reply(*, cmd: object, service_name: str) -> ParticipantReply:
+    return ParticipantReply(
+        tx_id=getattr(cmd, "tx_id", ""),
+        service=service_name,
+        command=getattr(cmd, "command", "unknown"),
+        ok=False,
+        error="internal_error",
+    )
 
 
 def handle_internal_rpc_delivery(
@@ -36,7 +57,15 @@ def handle_internal_rpc_delivery(
         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
         return
 
-    reply = dispatch(cmd)
+    try:
+        reply = dispatch(cmd)
+    except Exception:
+        logger.exception(
+            "Dispatch error for %s request=%s",
+            service_name,
+            getattr(cmd, "request_id", "?"),
+        )
+        reply = _internal_dispatch_failure_reply(cmd)
     try:
         publish_message(
             rabbitmq_url,
@@ -80,7 +109,16 @@ def handle_participant_delivery(
         getattr(cmd, "tx_id", "?"),
         getattr(cmd, "command", "?"),
     )
-    reply = dispatch(cmd)
+    try:
+        reply = dispatch(cmd)
+    except Exception:
+        logger.exception(
+            "Dispatch error for %s tx=%s command=%s",
+            service_name,
+            getattr(cmd, "tx_id", "?"),
+            getattr(cmd, "command", "?"),
+        )
+        reply = _participant_dispatch_failure_reply(cmd=cmd, service_name=service_name)
     try:
         publish_reply(rabbitmq_url, getattr(cmd, "reply_to", ""), encode_reply(reply))
         channel.basic_ack(delivery_tag=method.delivery_tag)

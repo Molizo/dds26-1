@@ -6,7 +6,7 @@ import redis
 from flask import Flask, jsonify
 
 from common.constants import VALID_PROTOCOLS
-from runtime_service import OrchestratorRuntime
+from orchestrator.runtime_service import OrchestratorRuntime
 
 CHECKOUT_PROTOCOL = os.environ.get("CHECKOUT_PROTOCOL", "").lower()
 if CHECKOUT_PROTOCOL not in VALID_PROTOCOLS:

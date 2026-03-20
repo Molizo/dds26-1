@@ -12,10 +12,10 @@ logger = logging.getLogger(__name__)
 
 def post_fork(server, worker):
     from common.rpc import init_rpc_reply_consumer
-    from coordinator.messaging import init_reply_consumer
-    from coordinator.recovery import start_recovery_worker
-    from app import _get_runtime
-    from worker import init_worker, start_consumer_thread
+    from orchestrator.messaging import init_reply_consumer
+    from orchestrator.recovery import start_recovery_worker
+    from orchestrator.app import _get_runtime
+    from orchestrator.worker import init_worker, start_consumer_thread
 
     rabbitmq_url = rabbitmq_url_from_env()
     runtime = _get_runtime()

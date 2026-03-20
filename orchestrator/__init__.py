@@ -1,1 +1,1 @@
-# Internal runtime package for the standalone orchestrator service.
+# Internal package for the standalone orchestrator service.

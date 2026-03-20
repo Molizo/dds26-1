@@ -14,9 +14,9 @@ from common.constants import (
 )
 from common.models import InternalCommand, InternalReply
 from common.result import CheckoutResult
-from coordinator.service import CoordinatorService
-from order_port import RabbitMqOrderPort
-import tx_store
+from orchestrator.service import CoordinatorService
+from orchestrator.order_port import RabbitMqOrderPort
+from orchestrator import tx_store
 
 DB_ERROR_STR = "DB error"
 

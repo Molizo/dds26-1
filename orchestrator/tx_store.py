@@ -8,7 +8,7 @@ import redis
 from redis.commands.core import Script
 
 from common.constants import ACTIVE_TX_GUARD_TTL, TERMINAL_STATUSES
-from coordinator.models import CheckoutTxValue
+from orchestrator.models import CheckoutTxValue
 
 logger = logging.getLogger(__name__)
 

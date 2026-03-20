@@ -279,8 +279,8 @@ print(json.dumps({{
 """.strip()
     tx_script = f"""
 import json
-from app import db
-from tx_store import get_active_tx_guard, get_commit_fence, get_decision, get_tx
+from orchestrator.app import db
+from orchestrator.tx_store import get_active_tx_guard, get_commit_fence, get_decision, get_tx
 
 tx = get_tx(db, {tx_id!r})
 print(json.dumps({{
@@ -300,8 +300,8 @@ def list_order_transactions(order_ids: list[str]) -> list[dict]:
     script = f"""
 import json
 import msgspec
-from app import db
-from coordinator.models import CheckoutTxValue
+from orchestrator.app import db
+from orchestrator.models import CheckoutTxValue
 
 decoder = msgspec.msgpack.Decoder(CheckoutTxValue)
 target_order_ids = set({order_ids!r})
@@ -334,7 +334,7 @@ print(json.dumps(results))
 def get_active_tx_guards(order_ids: list[str]) -> dict[str, str | None]:
     script = f"""
 import json
-from app import db
+from orchestrator.app import db
 
 order_ids = {order_ids!r}
 result = {{}}

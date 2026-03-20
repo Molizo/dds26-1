@@ -9,7 +9,7 @@ import sys
 import os
 import unittest
 
-# Allow importing common/ and coordinator/ from the repo root
+# Allow importing common/ and orchestrator/ from the repo root
 _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
@@ -212,7 +212,7 @@ class TestCheckoutResult(unittest.TestCase):
 class TestCoordinatorModels(unittest.TestCase):
 
     def test_make_tx(self):
-        from coordinator.models import make_tx, CheckoutTxValue
+        from orchestrator.models import make_tx, CheckoutTxValue
         from common.constants import STATUS_INIT
 
         tx = make_tx(
@@ -234,14 +234,14 @@ class TestCoordinatorModels(unittest.TestCase):
 
     def test_coordinator_has_no_flask_import(self):
         """Coordinator package must not import Flask — it must be extractable."""
-        import coordinator.models
-        import coordinator.ports
+        import orchestrator.models
+        import orchestrator.ports
         # If Flask were imported transitively, it would raise ImportError in
         # environments without Flask. Since this test runs in the same env, we
         # just verify the modules load without error and don't depend on Flask.
         self.assertFalse(
-            hasattr(coordinator.models, 'Flask'),
-            "coordinator.models must not expose Flask"
+            hasattr(orchestrator.models, 'Flask'),
+            "orchestrator.models must not expose Flask"
         )
 
 

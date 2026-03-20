@@ -7,7 +7,7 @@ from common.constants import (
     TERMINAL_STATUSES,
 )
 from common.models import OrderSnapshot, ParticipantReply
-from coordinator.service import CoordinatorService
+from orchestrator.service import CoordinatorService
 
 
 def make_snapshot(

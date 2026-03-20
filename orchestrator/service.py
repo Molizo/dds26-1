@@ -31,11 +31,11 @@ from common.models import (
 )
 from common.messaging import publish_command
 from common.result import CheckoutResult
-from coordinator.models import CheckoutTxValue, make_tx
-from coordinator.messaging import (
+from orchestrator.models import CheckoutTxValue, make_tx
+from orchestrator.messaging import (
     get_reply_queue, register_pending, wait_for_replies, cancel_pending,
 )
-from coordinator.ports import OrderPort, OrderPortUnavailable, TxStorePort
+from orchestrator.ports import OrderPort, OrderPortUnavailable, TxStorePort
 
 logger = logging.getLogger(__name__)
 

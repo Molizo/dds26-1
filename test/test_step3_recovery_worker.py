@@ -19,8 +19,8 @@ from common.constants import (
     TERMINAL_STATUSES,
 )
 from common.result import CheckoutResult
-from coordinator.models import make_tx
-from coordinator.recovery import RecoveryWorker
+from orchestrator.models import make_tx
+from orchestrator.recovery import RecoveryWorker
 
 
 class _MockTxStore:

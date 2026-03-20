@@ -26,26 +26,26 @@ from common.constants import (
 from common.models import decode_internal_reply, decode_reply, encode_internal_reply, encode_reply
 from common.result import CheckoutResult
 from common.worker_support import handle_internal_rpc_delivery, handle_participant_delivery
-from coordinator.models import make_tx
+from orchestrator.models import make_tx
 from helpers.coordinator_doubles import MockOrderPort, MockTxStore, make_snapshot, stock_reply
-from runtime_service import OrchestratorRuntime
+from orchestrator.runtime_service import OrchestratorRuntime
 
 
 class TestReplyCorrelationFiltering(unittest.TestCase):
     def setUp(self):
-        import coordinator.messaging as messaging
+        import orchestrator.messaging as messaging
         with messaging._correlation_lock:
             messaging._correlation_map.clear()
         messaging._reply_queue = "test.replies"
 
     def tearDown(self):
-        import coordinator.messaging as messaging
+        import orchestrator.messaging as messaging
         with messaging._correlation_lock:
             messaging._correlation_map.clear()
 
     def test_correct_phase_reply_records_before_ack(self):
-        import coordinator.messaging as messaging
-        from coordinator.messaging import _on_reply, register_pending
+        import orchestrator.messaging as messaging
+        from orchestrator.messaging import _on_reply, register_pending
 
         register_pending(
             "tx-ack",
@@ -76,8 +76,8 @@ class TestReplyCorrelationFiltering(unittest.TestCase):
         mock_channel.basic_ack.assert_called_once_with(delivery_tag=1)
 
     def test_out_of_phase_reply_is_ignored(self):
-        import coordinator.messaging as messaging
-        from coordinator.messaging import _on_reply, register_pending
+        import orchestrator.messaging as messaging
+        from orchestrator.messaging import _on_reply, register_pending
 
         register_pending(
             "tx-x",
@@ -97,8 +97,8 @@ class TestReplyCorrelationFiltering(unittest.TestCase):
         self.assertEqual(len(entry.replies), 0)
 
     def test_duplicate_service_reply_ignored(self):
-        import coordinator.messaging as messaging
-        from coordinator.messaging import _on_reply, register_pending
+        import orchestrator.messaging as messaging
+        from orchestrator.messaging import _on_reply, register_pending
 
         register_pending(
             "tx-dup",
@@ -122,8 +122,8 @@ class TestReplyCorrelationFiltering(unittest.TestCase):
         self.assertEqual(len(entry.replies), 1)
 
     def test_correct_phase_reply_signals_event(self):
-        import coordinator.messaging as messaging
-        from coordinator.messaging import _on_reply, register_pending
+        import orchestrator.messaging as messaging
+        from orchestrator.messaging import _on_reply, register_pending
 
         register_pending(
             "tx-y",
@@ -148,8 +148,8 @@ class TestReplyCorrelationFiltering(unittest.TestCase):
         self.assertEqual(len(entry.replies), 1)
 
     def test_wrong_service_reply_ignored(self):
-        import coordinator.messaging as messaging
-        from coordinator.messaging import _on_reply, register_pending
+        import orchestrator.messaging as messaging
+        from orchestrator.messaging import _on_reply, register_pending
 
         register_pending(
             "tx-ws",

@@ -29,7 +29,7 @@ spec:
         - name: orchestrator
           image: ttl.sh/dds26-1-orchestrator:24h
           imagePullPolicy: IfNotPresent
-          command: ["gunicorn", "-b", "0.0.0.0:5000", "-w", "6", "--threads", "12", "-k", "gthread", "-c", "gunicorn.conf.py", "--timeout", "30", "--log-level=info", "app:app"]
+          command: ["gunicorn", "-b", "0.0.0.0:5000", "-w", "6", "--threads", "12", "-k", "gthread", "-c", "orchestrator/gunicorn.conf.py", "--timeout", "30", "--log-level=info", "orchestrator.app:app"]
           resources:
             requests:
               cpu: "500m"

@@ -11,7 +11,7 @@ duck typing is sufficient.
 from typing import Optional, Protocol
 
 from common.models import OrderSnapshot
-from coordinator.models import CheckoutTxValue
+from orchestrator.models import CheckoutTxValue
 
 
 class OrderPortUnavailable(RuntimeError):

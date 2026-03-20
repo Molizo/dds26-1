@@ -57,7 +57,7 @@ services:
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - COORDINATOR_REPLY_PREFETCH_COUNT=64
       - CHECKOUT_PROTOCOL=saga
-    command: gunicorn -b 0.0.0.0:5000 -w 6 --threads 12 -k gthread -c gunicorn.conf.py --timeout 30 --graceful-timeout 20 --keep-alive 5 --max-requests 2000 --max-requests-jitter 200 --worker-tmp-dir /dev/shm --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 6 --threads 12 -k gthread -c orchestrator/gunicorn.conf.py --timeout 30 --graceful-timeout 20 --keep-alive 5 --max-requests 2000 --max-requests-jitter 200 --worker-tmp-dir /dev/shm --log-level=info orchestrator.app:app
     env_file:
       - env/orchestrator_redis.env
     depends_on:

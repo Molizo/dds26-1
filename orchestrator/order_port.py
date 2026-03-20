@@ -10,7 +10,7 @@ from common.models import (
     encode_internal_command,
 )
 from common.rpc import rpc_request_bytes
-from coordinator.ports import OrderPortUnavailable
+from orchestrator.ports import OrderPortUnavailable
 
 
 class RabbitMqOrderPort:

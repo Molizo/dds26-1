@@ -20,9 +20,9 @@ from common.constants import (
     RECOVERY_STALE_AGE,
     TERMINAL_STATUSES,
 )
-from coordinator.models import CheckoutTxValue
-from coordinator.ports import TxStorePort
-from coordinator.service import CoordinatorService
+from orchestrator.models import CheckoutTxValue
+from orchestrator.ports import TxStorePort
+from orchestrator.service import CoordinatorService
 
 logger = logging.getLogger(__name__)
 

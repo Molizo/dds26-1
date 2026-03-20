@@ -18,8 +18,8 @@ from common.constants import (
     STATUS_COMPLETED,
     STATUS_FAILED_NEEDS_RECOVERY,
 )
-from coordinator.ports import OrderPortUnavailable
-from coordinator.service import _aggregate_items
+from orchestrator.ports import OrderPortUnavailable
+from orchestrator.service import _aggregate_items
 from helpers.coordinator_doubles import (
     MockOrderPort,
     MockTxStore,
@@ -30,8 +30,8 @@ from helpers.coordinator_doubles import (
 )
 
 
-@patch("coordinator.service.publish_command")
-@patch("coordinator.service.get_reply_queue", return_value="test.replies")
+@patch("orchestrator.service.publish_command")
+@patch("orchestrator.service.get_reply_queue", return_value="test.replies")
 class TestSagaProtocol(unittest.TestCase):
     def _run(
         self,
@@ -51,9 +51,9 @@ class TestSagaProtocol(unittest.TestCase):
             commit_replies=commit_replies,
             release_replies=release_replies,
         )
-        with patch("coordinator.service.register_pending"), \
-             patch("coordinator.service.wait_for_replies", side_effect=mock_wait), \
-             patch("coordinator.service.cancel_pending"):
+        with patch("orchestrator.service.register_pending"), \
+             patch("orchestrator.service.wait_for_replies", side_effect=mock_wait), \
+             patch("orchestrator.service.cancel_pending"):
             result = coordinator.execute_checkout(make_snapshot(), PROTOCOL_SAGA)
         return result, op, ts
 
@@ -183,9 +183,9 @@ class TestSagaProtocol(unittest.TestCase):
 
     def test_saga_already_paid_snapshot_short_circuit(self, mock_queue, mock_publish):
         coordinator, _, _, _ = make_coordinator(order_port=MockOrderPort(snapshot=make_snapshot(paid=True)))
-        with patch("coordinator.service.register_pending"), \
-             patch("coordinator.service.wait_for_replies"), \
-             patch("coordinator.service.cancel_pending"):
+        with patch("orchestrator.service.register_pending"), \
+             patch("orchestrator.service.wait_for_replies"), \
+             patch("orchestrator.service.cancel_pending"):
             result = coordinator.execute_checkout(make_snapshot(paid=True), PROTOCOL_SAGA)
 
         self.assertTrue(result.success)
@@ -228,8 +228,8 @@ class TestSagaProtocol(unittest.TestCase):
         self.assertEqual(tx.last_error, "mark_paid_indeterminate")
 
 
-@patch("coordinator.service.publish_command")
-@patch("coordinator.service.get_reply_queue", return_value="test.replies")
+@patch("orchestrator.service.publish_command")
+@patch("orchestrator.service.get_reply_queue", return_value="test.replies")
 class TestTwoPCProtocol(unittest.TestCase):
     def _run(
         self,
@@ -249,9 +249,9 @@ class TestTwoPCProtocol(unittest.TestCase):
             commit_replies=commit_replies,
             release_replies=release_replies,
         )
-        with patch("coordinator.service.register_pending"), \
-             patch("coordinator.service.wait_for_replies", side_effect=mock_wait), \
-             patch("coordinator.service.cancel_pending"):
+        with patch("orchestrator.service.register_pending"), \
+             patch("orchestrator.service.wait_for_replies", side_effect=mock_wait), \
+             patch("orchestrator.service.cancel_pending"):
             result = coordinator.execute_checkout(make_snapshot(), PROTOCOL_2PC)
         return result, op, ts
 

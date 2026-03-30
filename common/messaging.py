@@ -7,7 +7,7 @@ Thread-safety model:
 - Participant consumer: one dedicated background thread per process with its
   own connection, consuming from stock.commands or payment.commands.
 - Reply consumer (coordinator): one dedicated background thread per process
-  consuming from an exclusive auto-delete reply queue. Added in Step 2.
+  consuming from a per-process reply queue that survives reconnects. Added in Step 2.
 - Correlation map: a shared {tx_id → (Event, result_slot)} dict protected by
   a threading.Lock. Request threads register before publishing; consumer thread
   signals. Added in Step 2.
@@ -18,7 +18,6 @@ Gunicorn prefork constraint:
   silently or raise exceptions. Use gunicorn's post_fork hook to start threads.
 """
 import logging
-import os
 import threading
 import time
 from typing import Callable, Optional
@@ -30,27 +29,17 @@ from common.constants import (
     PAYMENT_COMMANDS_QUEUE,
     STOCK_COMMANDS_DLQ,
     PAYMENT_COMMANDS_DLQ,
+    ORDER_COMMANDS_QUEUE,
+    ORCHESTRATOR_COMMANDS_QUEUE,
+    ORDER_COMMANDS_DLQ,
+    ORCHESTRATOR_COMMANDS_DLQ,
 )
+from common.env import get_positive_int_env
 
 logger = logging.getLogger(__name__)
 
 # Thread-local storage: each request thread owns its own pika connection.
 _thread_local = threading.local()
-
-
-def _get_positive_int_env(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        parsed = int(value)
-        if parsed > 0:
-            return parsed
-    except ValueError:
-        pass
-    logger.warning("Invalid %s=%r, using default=%d", name, value, default)
-    return default
-
 # ---------------------------------------------------------------------------
 # Queue topology
 # ---------------------------------------------------------------------------
@@ -63,6 +52,8 @@ def _declare_queues(channel) -> None:
     """
     channel.queue_declare(queue=STOCK_COMMANDS_DLQ, durable=True)
     channel.queue_declare(queue=PAYMENT_COMMANDS_DLQ, durable=True)
+    channel.queue_declare(queue=ORDER_COMMANDS_DLQ, durable=True)
+    channel.queue_declare(queue=ORCHESTRATOR_COMMANDS_DLQ, durable=True)
     channel.queue_declare(
         queue=STOCK_COMMANDS_QUEUE,
         durable=True,
@@ -77,6 +68,22 @@ def _declare_queues(channel) -> None:
         arguments={
             "x-dead-letter-exchange": "",
             "x-dead-letter-routing-key": PAYMENT_COMMANDS_DLQ,
+        },
+    )
+    channel.queue_declare(
+        queue=ORDER_COMMANDS_QUEUE,
+        durable=True,
+        arguments={
+            "x-dead-letter-exchange": "",
+            "x-dead-letter-routing-key": ORDER_COMMANDS_DLQ,
+        },
+    )
+    channel.queue_declare(
+        queue=ORCHESTRATOR_COMMANDS_QUEUE,
+        durable=True,
+        arguments={
+            "x-dead-letter-exchange": "",
+            "x-dead-letter-routing-key": ORCHESTRATOR_COMMANDS_DLQ,
         },
     )
 
@@ -114,15 +121,22 @@ def publish_command(rabbitmq_url: str, queue: str, body: bytes, reply_to: str) -
     Uses PERSISTENT delivery so messages survive a broker restart.
     Retries up to 3 times on connection errors; raises on final failure.
     """
-    _publish(rabbitmq_url, queue, body, reply_to=reply_to)
+    publish_message(rabbitmq_url, queue, body, reply_to=reply_to)
 
 
 def publish_reply(rabbitmq_url: str, reply_to: str, body: bytes) -> None:
     """Publish a participant reply to the coordinator's reply queue."""
-    _publish(rabbitmq_url, reply_to, body)
+    publish_message(rabbitmq_url, reply_to, body)
 
 
-def _publish(rabbitmq_url: str, routing_key: str, body: bytes, reply_to: Optional[str] = None) -> None:
+def publish_message(
+    rabbitmq_url: str,
+    routing_key: str,
+    body: bytes,
+    *,
+    reply_to: Optional[str] = None,
+    correlation_id: Optional[str] = None,
+) -> None:
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -130,6 +144,7 @@ def _publish(rabbitmq_url: str, routing_key: str, body: bytes, reply_to: Optiona
             props = pika.BasicProperties(
                 delivery_mode=2,  # persistent
                 reply_to=reply_to,
+                correlation_id=correlation_id,
             )
             channel.basic_publish(
                 exchange="",
@@ -180,7 +195,7 @@ def start_participant_consumer(
 def _run_participant_consumer(rabbitmq_url: str, queue: str, handler: Callable) -> None:
     """Consumer thread body. Reconnects on any error with exponential backoff."""
     backoff = 1
-    prefetch_count = _get_positive_int_env("PARTICIPANT_CONSUMER_PREFETCH_COUNT", 1)
+    prefetch_count = get_positive_int_env("PARTICIPANT_CONSUMER_PREFETCH_COUNT", 1, logger)
     while True:
         try:
             conn = pika.BlockingConnection(pika.URLParameters(rabbitmq_url))

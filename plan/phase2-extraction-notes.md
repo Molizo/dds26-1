@@ -1,5 +1,16 @@
 # Phase 2 Extraction Notes: Standalone Orchestrator
 
+## Status Update
+
+Updated on **March 19, 2026**:
+
+1. The active implementation now uses RabbitMQ request/reply for all internal `order-service` <-> `orchestrator` coordination.
+2. Public checkout still enters `order-service`, but it no longer forwards to the orchestrator over internal HTTP.
+3. The old `GET /internal/orders/{order_id}` and `POST /internal/orders/{order_id}/mark_paid` plan has been removed from the codebase; order reads and mark-paid now run through internal MQ commands.
+4. The orchestrator remains internal-only in both docker-compose and Kubernetes.
+
+The transport details in the rest of this document are historical planning context. Where they conflict with the implementation above, the MQ-based internal contract is the current source of truth.
+
 ## Purpose
 
 This document captures the intended Phase 2 direction from `assignment.md` without expanding the current Phase 1 implementation scope too early.
@@ -103,11 +114,13 @@ The RabbitMQ-based architecture makes extraction simple: participants already co
 4. transaction status transitions and state machine
 5. active-tx guard lifecycle (`order_active_tx:{order_id}` in orchestrator Redis)
 6. commit-fence handling (`order_commit_fence:{order_id}` in orchestrator Redis)
-7. recovery worker and `resume_transaction` logic
-8. participant coordination via RabbitMQ
-9. deciding whether a transaction commits, aborts, compensates, or remains in recovery
-10. `GET /internal/tx_decision/{tx_id}` endpoint
-11. already-paid fast path (reads order via `OrderPort`, returns 200 if paid with no tx overhead)
+7. order-mutation guard lifecycle (`order_mutation_guard:{order_id}` in orchestrator Redis)
+8. recovery worker and `resume_transaction` logic
+9. participant coordination via RabbitMQ
+10. deciding whether a transaction commits, aborts, compensates, or remains in recovery
+11. `GET /internal/tx_decision/{tx_id}` endpoint
+12. internal mutation-guard endpoints used by the order service before mutating an order
+13. already-paid fast path (reads order via `OrderPort`, returns 200 if paid with no tx overhead)
 
 ### Order Service Owns
 
@@ -117,6 +130,7 @@ The RabbitMQ-based architecture makes extraction simple: participants already co
 4. order-domain persistence (own Redis: `order:{order_id}`)
 5. `POST /internal/orders/{order_id}/mark_paid` — called by orchestrator via `OrderPort`
 6. `GET /internal/orders/{order_id}` — called by orchestrator via `OrderPort`
+7. `addItem` checks with the orchestrator before mutating an order so checkout and mutation remain mutually exclusive after the active-tx guard moves out of order Redis
 
 ### Payment Service Owns
 
@@ -239,7 +253,7 @@ In Phase 2, storage splits:
 | Owner | Data | Redis instance |
 |-------|------|----------------|
 | `order` | order-domain records (`order:{order_id}`) | order Redis (existing) |
-| `orchestrator` | tx records, decision markers, active-tx guards, commit fences | orchestrator Redis (new) |
+| `orchestrator` | tx records, decision markers, active-tx guards, mutation guards, commit fences | orchestrator Redis (new) |
 | `payment` | user records, participant tx records | payment Redis (existing) |
 | `stock` | item records, participant tx records | stock Redis (existing) |
 
@@ -308,6 +322,7 @@ In Phase 1, the checkout route acquires the active-tx guard before calling the c
 1. The orchestrator owns both acquisition and clearing of the active-tx guard (it lives in orchestrator Redis now).
 2. The orchestrator's checkout route acquires the guard, runs the protocol, and clears the guard on terminal state.
 3. No split ownership — the orchestrator is the single owner of the entire checkout lifecycle.
+4. Because `addItem` still lives in the order service, the orchestrator also owns a short-lived order-mutation guard used by the order service before mutating an order. Checkout must not start while a mutation guard exists, and order mutation must not start while an active checkout guard exists.
 
 ### Step 6: Move recovery with the coordinator
 

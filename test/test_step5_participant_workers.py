@@ -31,7 +31,7 @@ from live_stack_utils import (
 
 class TestParticipantWorkerIntegration(LiveStackTestCase):
     def setUp(self):
-        for service_name in ("order-service", "stock-service", "payment-service"):
+        for service_name in ("order-service", "orchestrator-service", "stock-service", "payment-service"):
             # start is idempotent and cheaper than full restart for test setup
             run_compose("start", service_name)
             wait_gateway_ready()
@@ -163,6 +163,7 @@ class TestParticipantWorkerIntegration(LiveStackTestCase):
             (PAYMENT_COMMANDS_QUEUE, PAYMENT_COMMANDS_DLQ),
         ):
             with self.subTest(queue=queue_name):
+                wait_for_queue_consumers(queue_name, minimum=1, timeout_seconds=30.0)
                 purge_queue(queue_name)
                 purge_queue(dlq_name)
 

@@ -24,17 +24,18 @@ from common.constants import (
     TERMINAL_STATUSES,
 )
 from common.models import (
+    OrderSnapshot,
     ParticipantCommand, ParticipantReply,
     StockHoldPayload, PaymentHoldPayload,
     encode_command,
 )
 from common.messaging import publish_command
 from common.result import CheckoutResult
-from coordinator.models import CheckoutTxValue, make_tx
-from coordinator.messaging import (
+from orchestrator.models import CheckoutTxValue, make_tx
+from orchestrator.messaging import (
     get_reply_queue, register_pending, wait_for_replies, cancel_pending,
 )
-from coordinator.ports import OrderPort, TxStorePort, OrderSnapshot
+from orchestrator.ports import OrderPort, OrderPortUnavailable, TxStorePort
 
 logger = logging.getLogger(__name__)
 
@@ -58,22 +59,16 @@ class CoordinatorService:
 
     def execute_checkout(
         self,
-        order_id: str,
+        snapshot: OrderSnapshot,
         protocol: str,
         tx_id: Optional[str] = None,
     ) -> CheckoutResult:
         """Run a full checkout transaction for the given order.
 
         The caller (route layer) is responsible for:
-        - validating the order exists
-        - checking the already-paid fast path
         - acquiring the active-tx guard
         - clearing the guard on terminal result
         """
-        snapshot = self._orders.read_order(order_id)
-        if snapshot is None:
-            return CheckoutResult.fail("Order not found", code=400)
-
         if snapshot.paid:
             return CheckoutResult.paid()
 
@@ -84,7 +79,7 @@ class CoordinatorService:
             tx_id = str(uuid.uuid4())
         tx = make_tx(
             tx_id=tx_id,
-            order_id=order_id,
+            order_id=snapshot.order_id,
             user_id=snapshot.user_id,
             total_cost=snapshot.total_cost,
             protocol=protocol,
@@ -115,15 +110,15 @@ class CoordinatorService:
         tx.status = STATUS_HOLDING
         self._tx.update_tx(tx)
 
-        stock_replies, payment_replies = self._publish_and_wait_holds(tx)
-        stock_reply = _find_reply(stock_replies, SVC_STOCK)
-        payment_reply = _find_reply(payment_replies, SVC_PAYMENT)
-
-        # Update flags from replies — batch into one persist
-        if stock_reply and stock_reply.ok:
-            tx.stock_held = True
-        if payment_reply and payment_reply.ok:
-            tx.payment_held = True
+        replies = self._publish_and_wait_holds(tx)
+        stock_reply = _find_reply(replies, SVC_STOCK)
+        payment_reply = _find_reply(replies, SVC_PAYMENT)
+        self._apply_phase_outcomes(
+            tx,
+            replies,
+            stock_attr="stock_held",
+            payment_attr="payment_held",
+        )
 
         # --- Decision ---
         if tx.stock_held and tx.payment_held:
@@ -139,7 +134,14 @@ class CoordinatorService:
     def _saga_commit(self, tx: CheckoutTxValue) -> CheckoutResult:
         """SAGA commit: mark order paid, then send commit commands."""
         # Mark order paid (idempotent) before entering COMMITTING
-        if not self._orders.mark_paid(tx.order_id, tx.tx_id):
+        try:
+            marked_paid = self._orders.mark_paid(tx.order_id, tx.tx_id)
+        except OrderPortUnavailable:
+            tx.status = STATUS_FAILED_NEEDS_RECOVERY
+            tx.last_error = "mark_paid_indeterminate"
+            self._tx.update_tx(tx)
+            return CheckoutResult.fail("mark_paid_indeterminate")
+        if not marked_paid:
             tx.last_error = "mark_paid_failed"
             return self._saga_compensate(tx)
 
@@ -171,13 +173,26 @@ class CoordinatorService:
         tx.retry_count += 1
 
         # Check if order is already paid (crash after mark_paid but before COMMITTING)
-        snapshot = self._orders.read_order(tx.order_id)
+        try:
+            snapshot = self._orders.read_order(tx.order_id)
+        except OrderPortUnavailable:
+            tx.status = STATUS_FAILED_NEEDS_RECOVERY
+            tx.last_error = "order_read_failed"
+            self._tx.update_tx(tx)
+            return CheckoutResult.fail("order_read_failed")
         order_paid = snapshot.paid if snapshot else False
 
         if tx.status == STATUS_COMMITTING or order_paid:
             # Forward recovery: order is paid, just need to finalize commits
             if not order_paid:
-                if not self._orders.mark_paid(tx.order_id, tx.tx_id):
+                try:
+                    marked_paid = self._orders.mark_paid(tx.order_id, tx.tx_id)
+                except OrderPortUnavailable:
+                    tx.status = STATUS_FAILED_NEEDS_RECOVERY
+                    tx.last_error = "mark_paid_indeterminate"
+                    self._tx.update_tx(tx)
+                    return CheckoutResult.fail("mark_paid_indeterminate")
+                if not marked_paid:
                     tx.status = STATUS_FAILED_NEEDS_RECOVERY
                     tx.last_error = "mark_paid_failed"
                     self._tx.update_tx(tx)
@@ -212,14 +227,15 @@ class CoordinatorService:
         tx.status = STATUS_HOLDING
         self._tx.update_tx(tx)
 
-        stock_replies, payment_replies = self._publish_and_wait_holds(tx)
-        stock_reply = _find_reply(stock_replies, SVC_STOCK)
-        payment_reply = _find_reply(payment_replies, SVC_PAYMENT)
-
-        if stock_reply and stock_reply.ok:
-            tx.stock_held = True
-        if payment_reply and payment_reply.ok:
-            tx.payment_held = True
+        replies = self._publish_and_wait_holds(tx)
+        stock_reply = _find_reply(replies, SVC_STOCK)
+        payment_reply = _find_reply(replies, SVC_PAYMENT)
+        self._apply_phase_outcomes(
+            tx,
+            replies,
+            stock_attr="stock_held",
+            payment_attr="payment_held",
+        )
 
         if tx.stock_held and tx.payment_held:
             tx.status = STATUS_HELD
@@ -255,7 +271,14 @@ class CoordinatorService:
             return CheckoutResult.fail("commit_confirmation_incomplete")
 
         # Commits confirmed — now mark order paid, then finalize.
-        if not self._orders.mark_paid(tx.order_id, tx.tx_id):
+        try:
+            marked_paid = self._orders.mark_paid(tx.order_id, tx.tx_id)
+        except OrderPortUnavailable:
+            tx.status = STATUS_FAILED_NEEDS_RECOVERY
+            tx.last_error = "mark_paid_indeterminate"
+            self._tx.update_tx(tx)
+            return CheckoutResult.fail("mark_paid_indeterminate")
+        if not marked_paid:
             tx.status = STATUS_FAILED_NEEDS_RECOVERY
             tx.last_error = "mark_paid_failed"
             self._tx.update_tx(tx)
@@ -285,7 +308,13 @@ class CoordinatorService:
             decision = "commit"
 
         # Check if order already paid
-        snapshot = self._orders.read_order(tx.order_id)
+        try:
+            snapshot = self._orders.read_order(tx.order_id)
+        except OrderPortUnavailable:
+            tx.status = STATUS_FAILED_NEEDS_RECOVERY
+            tx.last_error = "order_read_failed"
+            self._tx.update_tx(tx)
+            return CheckoutResult.fail("order_read_failed")
         order_paid = snapshot.paid if snapshot else False
         if order_paid:
             decision = "commit"
@@ -298,7 +327,14 @@ class CoordinatorService:
                 return CheckoutResult.fail("commit_confirmation_incomplete")
             # Commits confirmed — mark paid (idempotent) then finalize
             if not order_paid:
-                if not self._orders.mark_paid(tx.order_id, tx.tx_id):
+                try:
+                    marked_paid = self._orders.mark_paid(tx.order_id, tx.tx_id)
+                except OrderPortUnavailable:
+                    tx.status = STATUS_FAILED_NEEDS_RECOVERY
+                    tx.last_error = "mark_paid_indeterminate"
+                    self._tx.update_tx(tx)
+                    return CheckoutResult.fail("mark_paid_indeterminate")
+                if not marked_paid:
                     tx.status = STATUS_FAILED_NEEDS_RECOVERY
                     tx.last_error = "mark_paid_failed"
                     self._tx.update_tx(tx)
@@ -311,25 +347,13 @@ class CoordinatorService:
 
         return self._2pc_abort(tx)
 
-    # ------------------------------------------------------------------
-    # Tx persistence compatibility helpers
-    # ------------------------------------------------------------------
-
     def _persist_decision_and_update_tx(
         self,
         tx_id: str,
         decision: str,
         tx: CheckoutTxValue,
     ) -> None:
-        """Use combined decision+update call when available, else fallback."""
-        combined = getattr(self._tx, "set_decision_and_update_tx", None)
-        if callable(combined):
-            combined(tx_id, decision, tx)
-            return
-
-        # Backward-compatible sequence for older TxStore implementations.
-        self._tx.set_decision(tx_id, decision)
-        self._tx.update_tx(tx)
+        self._tx.set_decision_and_update_tx(tx_id, decision, tx)
 
     def _persist_decision_fence_and_update_tx(
         self,
@@ -338,65 +362,14 @@ class CoordinatorService:
         order_id: str,
         tx: CheckoutTxValue,
     ) -> None:
-        """Use combined decision+fence+update call when available, else fallback."""
-        combined = getattr(self._tx, "set_decision_fence_and_update_tx", None)
-        if callable(combined):
-            combined(tx_id, decision, order_id, tx)
-            return
-
-        # Backward-compatible sequence for older TxStore implementations.
-        self._tx.set_decision(tx_id, decision)
-        self._tx.set_commit_fence(order_id, tx_id)
-        self._tx.update_tx(tx)
+        self._tx.set_decision_fence_and_update_tx(tx_id, decision, order_id, tx)
 
     # ------------------------------------------------------------------
     # Shared mechanics: publish and wait
     # ------------------------------------------------------------------
 
-    def _publish_and_wait_holds(
-        self, tx: CheckoutTxValue
-    ) -> tuple[list[ParticipantReply], list[ParticipantReply]]:
-        """Publish hold commands to stock+payment in parallel, wait for replies.
-
-        Returns (all_replies_for_stock_filtering, all_replies_for_payment_filtering).
-        Both are from the same reply list, just the full list twice for convenience.
-        """
-        reply_queue = get_reply_queue()
-        register_pending(tx.tx_id, expected_command=CMD_HOLD,
-                         expected_services=frozenset({SVC_STOCK, SVC_PAYMENT}))
-
-        try:
-            # Build commands
-            stock_cmd = ParticipantCommand(
-                tx_id=tx.tx_id,
-                command=CMD_HOLD,
-                reply_to=reply_queue,
-                stock_payload=StockHoldPayload(items=tx.items_snapshot),
-            )
-            payment_cmd = ParticipantCommand(
-                tx_id=tx.tx_id,
-                command=CMD_HOLD,
-                reply_to=reply_queue,
-                payment_payload=PaymentHoldPayload(
-                    user_id=tx.user_id,
-                    amount=tx.total_cost,
-                ),
-            )
-
-            # Publish both (thread-local connections, so sequential is fine)
-            publish_command(self._rabbitmq_url, STOCK_COMMANDS_QUEUE,
-                           encode_command(stock_cmd), reply_queue)
-            publish_command(self._rabbitmq_url, PAYMENT_COMMANDS_QUEUE,
-                           encode_command(payment_cmd), reply_queue)
-
-            # Wait for replies
-            replies = wait_for_replies(tx.tx_id, timeout=PARTICIPANT_REPLY_TIMEOUT)
-            return replies, replies
-
-        except Exception as exc:
-            logger.error("Error publishing hold commands tx=%s: %s", tx.tx_id, exc)
-            cancel_pending(tx.tx_id)
-            return [], []
+    def _publish_and_wait_holds(self, tx: CheckoutTxValue) -> list[ParticipantReply]:
+        return self._publish_and_wait_phase(tx, CMD_HOLD, need_stock=True, need_payment=True)
 
     def _publish_commits(self, tx: CheckoutTxValue) -> bool:
         """Publish commit commands and wait for confirmations.
@@ -406,51 +379,23 @@ class CoordinatorService:
         Returns True if all needed commits were confirmed, False otherwise.
         Callers are responsible for the correct finalization sequence.
         """
-        # Determine which participants still need commits
         need_stock = not tx.stock_committed
         need_payment = not tx.payment_committed
-        expected_services = frozenset(
-            ({SVC_STOCK} if need_stock else set()) |
-            ({SVC_PAYMENT} if need_payment else set())
-        )
-
-        if not expected_services:
+        if not self._expected_services(need_stock=need_stock, need_payment=need_payment):
             return True  # already done
 
-        reply_queue = get_reply_queue()
-        register_pending(tx.tx_id, expected_command=CMD_COMMIT,
-                         expected_services=expected_services)
-
-        try:
-            if need_stock:
-                cmd = ParticipantCommand(
-                    tx_id=tx.tx_id, command=CMD_COMMIT, reply_to=reply_queue,
-                    stock_payload=StockHoldPayload(items=tx.items_snapshot),
-                )
-                publish_command(self._rabbitmq_url, STOCK_COMMANDS_QUEUE,
-                               encode_command(cmd), reply_queue)
-
-            if need_payment:
-                cmd = ParticipantCommand(
-                    tx_id=tx.tx_id, command=CMD_COMMIT, reply_to=reply_queue,
-                    payment_payload=PaymentHoldPayload(
-                        user_id=tx.user_id, amount=tx.total_cost),
-                )
-                publish_command(self._rabbitmq_url, PAYMENT_COMMANDS_QUEUE,
-                               encode_command(cmd), reply_queue)
-
-            replies = wait_for_replies(tx.tx_id, timeout=PARTICIPANT_REPLY_TIMEOUT)
-
-        except Exception as exc:
-            logger.error("Error publishing commit commands tx=%s: %s", tx.tx_id, exc)
-            cancel_pending(tx.tx_id)
-            replies = []
-
-        for r in replies:
-            if r.service == SVC_STOCK and r.ok:
-                tx.stock_committed = True
-            elif r.service == SVC_PAYMENT and r.ok:
-                tx.payment_committed = True
+        replies = self._publish_and_wait_phase(
+            tx,
+            CMD_COMMIT,
+            need_stock=need_stock,
+            need_payment=need_payment,
+        )
+        self._apply_phase_outcomes(
+            tx,
+            replies,
+            stock_attr="stock_committed",
+            payment_attr="payment_committed",
+        )
         self._tx.update_tx(tx)
 
         if not (tx.stock_committed and tx.payment_committed):
@@ -463,52 +408,23 @@ class CoordinatorService:
 
     def _publish_releases(self, tx: CheckoutTxValue) -> CheckoutResult:
         """Publish release/refund commands and wait for confirmations."""
-        reply_queue = get_reply_queue()
-
-        # Release all participants that may have succeeded (including timed-out ones)
         need_stock = not tx.stock_released
         need_payment = not tx.payment_released
-        expected_services = frozenset(
-            ({SVC_STOCK} if need_stock else set()) |
-            ({SVC_PAYMENT} if need_payment else set())
-        )
-
-        if not expected_services:
+        if not self._expected_services(need_stock=need_stock, need_payment=need_payment):
             return self._finalize_aborted(tx)
 
-        register_pending(tx.tx_id, expected_command=CMD_RELEASE,
-                         expected_services=expected_services)
-
-        try:
-            if need_stock:
-                cmd = ParticipantCommand(
-                    tx_id=tx.tx_id, command=CMD_RELEASE, reply_to=reply_queue,
-                    stock_payload=StockHoldPayload(items=tx.items_snapshot),
-                )
-                publish_command(self._rabbitmq_url, STOCK_COMMANDS_QUEUE,
-                               encode_command(cmd), reply_queue)
-
-            if need_payment:
-                cmd = ParticipantCommand(
-                    tx_id=tx.tx_id, command=CMD_RELEASE, reply_to=reply_queue,
-                    payment_payload=PaymentHoldPayload(
-                        user_id=tx.user_id, amount=tx.total_cost),
-                )
-                publish_command(self._rabbitmq_url, PAYMENT_COMMANDS_QUEUE,
-                               encode_command(cmd), reply_queue)
-
-            replies = wait_for_replies(tx.tx_id, timeout=PARTICIPANT_REPLY_TIMEOUT)
-
-        except Exception as exc:
-            logger.error("Error publishing release commands tx=%s: %s", tx.tx_id, exc)
-            cancel_pending(tx.tx_id)
-            replies = []
-
-        for r in replies:
-            if r.service == SVC_STOCK and r.ok:
-                tx.stock_released = True
-            elif r.service == SVC_PAYMENT and r.ok:
-                tx.payment_released = True
+        replies = self._publish_and_wait_phase(
+            tx,
+            CMD_RELEASE,
+            need_stock=need_stock,
+            need_payment=need_payment,
+        )
+        self._apply_phase_outcomes(
+            tx,
+            replies,
+            stock_attr="stock_released",
+            payment_attr="payment_released",
+        )
         self._tx.update_tx(tx)
 
         if tx.stock_released and tx.payment_released:
@@ -518,6 +434,117 @@ class CoordinatorService:
             tx.last_error = "release_confirmation_incomplete"
             self._tx.update_tx(tx)
             return CheckoutResult.fail(tx.last_error or "abort_incomplete")
+
+    def _publish_and_wait_phase(
+        self,
+        tx: CheckoutTxValue,
+        command: str,
+        *,
+        need_stock: bool,
+        need_payment: bool,
+    ) -> list[ParticipantReply]:
+        expected_services = self._expected_services(
+            need_stock=need_stock,
+            need_payment=need_payment,
+        )
+        if not expected_services:
+            return []
+
+        reply_queue = get_reply_queue()
+        register_pending(
+            tx.tx_id,
+            expected_command=command,
+            expected_services=expected_services,
+        )
+
+        try:
+            for queue_name, participant_command in self._build_phase_commands(
+                tx,
+                command,
+                reply_queue,
+                need_stock=need_stock,
+                need_payment=need_payment,
+            ):
+                publish_command(
+                    self._rabbitmq_url,
+                    queue_name,
+                    encode_command(participant_command),
+                    reply_queue,
+                )
+            return wait_for_replies(tx.tx_id, timeout=PARTICIPANT_REPLY_TIMEOUT)
+        except Exception as exc:
+            logger.error("Error publishing %s commands tx=%s: %s", command, tx.tx_id, exc)
+            cancel_pending(tx.tx_id)
+            return []
+
+    def _build_phase_commands(
+        self,
+        tx: CheckoutTxValue,
+        command: str,
+        reply_queue: str,
+        *,
+        need_stock: bool,
+        need_payment: bool,
+    ) -> list[tuple[str, ParticipantCommand]]:
+        commands: list[tuple[str, ParticipantCommand]] = []
+        if need_stock:
+            commands.append((STOCK_COMMANDS_QUEUE, self._build_stock_command(tx, command, reply_queue)))
+        if need_payment:
+            commands.append((PAYMENT_COMMANDS_QUEUE, self._build_payment_command(tx, command, reply_queue)))
+        return commands
+
+    def _build_stock_command(
+        self,
+        tx: CheckoutTxValue,
+        command: str,
+        reply_queue: str,
+    ) -> ParticipantCommand:
+        return ParticipantCommand(
+            tx_id=tx.tx_id,
+            command=command,
+            reply_to=reply_queue,
+            stock_payload=StockHoldPayload(items=tx.items_snapshot),
+        )
+
+    def _build_payment_command(
+        self,
+        tx: CheckoutTxValue,
+        command: str,
+        reply_queue: str,
+    ) -> ParticipantCommand:
+        return ParticipantCommand(
+            tx_id=tx.tx_id,
+            command=command,
+            reply_to=reply_queue,
+            payment_payload=PaymentHoldPayload(
+                user_id=tx.user_id,
+                amount=tx.total_cost,
+            ),
+        )
+
+    def _expected_services(self, *, need_stock: bool, need_payment: bool) -> frozenset[str]:
+        services = set()
+        if need_stock:
+            services.add(SVC_STOCK)
+        if need_payment:
+            services.add(SVC_PAYMENT)
+        return frozenset(services)
+
+    def _apply_phase_outcomes(
+        self,
+        tx: CheckoutTxValue,
+        replies: list[ParticipantReply],
+        *,
+        stock_attr: str,
+        payment_attr: str,
+    ) -> None:
+        for reply in replies:
+            if not reply.ok:
+                continue
+            if reply.service == SVC_STOCK:
+                setattr(tx, stock_attr, True)
+            elif reply.service == SVC_PAYMENT:
+                setattr(tx, payment_attr, True)
 
     # ------------------------------------------------------------------
     # Terminal state transitions

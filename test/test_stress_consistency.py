@@ -91,7 +91,7 @@ def _add_item_to_order_with_retry(
 
 class TestStressConsistency(LiveStackTestCase):
     def setUp(self):
-        run_compose("start", "order-service", "stock-service", "payment-service")
+        run_compose("start", "order-service", "orchestrator-service", "stock-service", "payment-service")
         wait_gateway_ready()
         _wait_public_routes_ready()
 

@@ -29,7 +29,7 @@ from live_stack_utils import (
 
 class TestRecoveryConvergence(LiveStackTestCase):
     def setUp(self):
-        run_compose("start", "order-service", "stock-service", "payment-service")
+        run_compose("start", "order-service", "orchestrator-service", "stock-service", "payment-service")
         wait_gateway_ready()
 
         for queue_name in (
@@ -44,7 +44,7 @@ class TestRecoveryConvergence(LiveStackTestCase):
         wait_for_queue_consumers(PAYMENT_COMMANDS_QUEUE, minimum=1, timeout_seconds=30.0)
 
     def tearDown(self):
-        run_compose("start", "order-service", "stock-service", "payment-service")
+        run_compose("start", "order-service", "orchestrator-service", "stock-service", "payment-service")
         wait_gateway_ready()
 
     def test_failed_checkout_recovers_to_aborted_then_allows_clean_retry(self):
@@ -98,9 +98,9 @@ class TestRecoveryConvergence(LiveStackTestCase):
         self.assertEqual(tu.find_user(user_id)["credit"], 100)
 
         # Recovery scans only stale txs. Sleeping past the stale-age threshold and
-        # then restarting order-service triggers an immediate startup scan.
+        # then restarting orchestrator-service triggers an immediate startup scan.
         time.sleep(16.0)
-        run_compose("restart", "order-service")
+        run_compose("restart", "orchestrator-service")
         wait_gateway_ready(timeout_seconds=60.0)
 
         def _aborted_and_clean():
@@ -112,7 +112,7 @@ class TestRecoveryConvergence(LiveStackTestCase):
 
         wait_until(
             _aborted_and_clean,
-            timeout_seconds=45.0,
+            timeout_seconds=60.0,
             message="Recovery did not converge the failed tx to ABORTED with guard cleanup",
             interval_seconds=1.0,
         )

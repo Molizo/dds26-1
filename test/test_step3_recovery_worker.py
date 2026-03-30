@@ -10,6 +10,8 @@ if _repo_root not in sys.path:
 
 from common.constants import (
     PROTOCOL_SAGA,
+    RECOVERY_LEADER_LOCK_TTL,
+    RECOVERY_SCAN_INTERVAL,
     STATUS_ABORTED,
     STATUS_COMPLETED,
     STATUS_FAILED_NEEDS_RECOVERY,
@@ -17,8 +19,8 @@ from common.constants import (
     TERMINAL_STATUSES,
 )
 from common.result import CheckoutResult
-from coordinator.models import make_tx
-from coordinator.recovery import RecoveryWorker
+from orchestrator.models import make_tx
+from orchestrator.recovery import RecoveryWorker
 
 
 class _MockTxStore:
@@ -54,6 +56,12 @@ class _MockTxStore:
 
     def clear_active_tx_guard(self, order_id):
         self.guards.pop(order_id, None)
+
+    def clear_active_tx_guard_if_owned(self, order_id, tx_id):
+        if self.guards.get(order_id) != tx_id:
+            return False
+        self.guards.pop(order_id, None)
+        return True
 
     def refresh_active_tx_guard(self, order_id, ttl):
         if order_id not in self.guards:
@@ -108,6 +116,8 @@ def _make_stale_tx(
 
 
 class TestRecoveryWorker(unittest.TestCase):
+    def test_recovery_leader_lease_outlasts_scan_interval(self):
+        self.assertGreaterEqual(RECOVERY_LEADER_LOCK_TTL, RECOVERY_SCAN_INTERVAL)
 
     def test_startup_scan_resumes_stale_tx_and_clears_guard_on_terminal(self):
         tx_store = _MockTxStore()

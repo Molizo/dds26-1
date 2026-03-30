@@ -1,4 +1,3 @@
-version: "3"
 services:
 
   gateway:
@@ -33,11 +32,8 @@ services:
     image: order:latest
     environment:
       - STOCK_SERVICE_URL=http://stock-service:5000
-      - PAYMENT_SERVICE_URL=http://payment-service:5000
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
-      - COORDINATOR_REPLY_PREFETCH_COUNT=64
-      - CHECKOUT_PROTOCOL=saga
-    command: gunicorn -b 0.0.0.0:5000 -w 8 --threads 12 -k gthread -c gunicorn.conf.py --timeout 30 --graceful-timeout 20 --keep-alive 5 --max-requests 2000 --max-requests-jitter 200 --worker-tmp-dir /dev/shm --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 4 --threads 8 -k gthread -c gunicorn.conf.py --timeout 30 --graceful-timeout 20 --keep-alive 5 --max-requests 2000 --max-requests-jitter 200 --worker-tmp-dir /dev/shm --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:
@@ -45,8 +41,37 @@ services:
         condition: service_started
       rabbitmq:
         condition: service_healthy
+      orchestrator-service:
+        condition: service_healthy
 
   order-db:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+
+  orchestrator-service:
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    image: orchestrator:latest
+    environment:
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - COORDINATOR_REPLY_PREFETCH_COUNT=64
+      - CHECKOUT_PROTOCOL=saga
+    command: gunicorn -b 0.0.0.0:5000 -w 6 --threads 12 -k gthread -c orchestrator/gunicorn.conf.py --timeout 30 --graceful-timeout 20 --keep-alive 5 --max-requests 2000 --max-requests-jitter 200 --worker-tmp-dir /dev/shm --log-level=info orchestrator.app:app
+    env_file:
+      - env/orchestrator_redis.env
+    depends_on:
+      orchestrator-db:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  orchestrator-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
 
@@ -56,10 +81,8 @@ services:
       dockerfile: stock/Dockerfile
     image: stock:latest
     environment:
-      - ORDER_SERVICE_URL=http://order-service:5000
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - PARTICIPANT_CONSUMER_PREFETCH_COUNT=8
-      - CHECKOUT_PROTOCOL=saga
     command: gunicorn -b 0.0.0.0:5000 -w 8 -c gunicorn.conf.py --timeout 30 --graceful-timeout 20 --keep-alive 5 --max-requests 2000 --max-requests-jitter 200 --worker-tmp-dir /dev/shm --log-level=info app:app
     env_file:
       - env/stock_redis.env
@@ -79,10 +102,8 @@ services:
       dockerfile: payment/Dockerfile
     image: user:latest
     environment:
-      - ORDER_SERVICE_URL=http://order-service:5000
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - PARTICIPANT_CONSUMER_PREFETCH_COUNT=8
-      - CHECKOUT_PROTOCOL=saga
     command: gunicorn -b 0.0.0.0:5000 -w 8 -c gunicorn.conf.py --timeout 30 --graceful-timeout 20 --keep-alive 5 --max-requests 2000 --max-requests-jitter 200 --worker-tmp-dir /dev/shm --log-level=info app:app
     env_file:
       - env/payment_redis.env

@@ -267,15 +267,23 @@ def docker_exec_service_python(service: str, script: str) -> str:
 
 
 def inspect_order_runtime(order_id: str, tx_id: str) -> dict:
-    script = f"""
+    order_script = f"""
 import json
 from app import db
-from store import get_active_tx_guard, get_commit_fence, get_decision, get_order, get_tx
+from store import read_order_snapshot
 
-order = get_order(db, {order_id!r})
-tx = get_tx(db, {tx_id!r})
+order = read_order_snapshot(db, {order_id!r})
 print(json.dumps({{
     "order_paid": None if order is None else bool(order.paid),
+}}))
+""".strip()
+    tx_script = f"""
+import json
+from orchestrator.app import db
+from orchestrator.tx_store import get_active_tx_guard, get_commit_fence, get_decision, get_tx
+
+tx = get_tx(db, {tx_id!r})
+print(json.dumps({{
     "active_guard": get_active_tx_guard(db, {order_id!r}),
     "decision": get_decision(db, {tx_id!r}),
     "commit_fence": get_commit_fence(db, {order_id!r}),
@@ -283,15 +291,17 @@ print(json.dumps({{
     "tx_retry_count": None if tx is None else tx.retry_count,
 }}))
 """.strip()
-    return json.loads(docker_exec_service_python("order-service", script))
+    order_runtime = json.loads(docker_exec_service_python("order-service", order_script))
+    tx_runtime = json.loads(docker_exec_service_python("orchestrator-service", tx_script))
+    return {**order_runtime, **tx_runtime}
 
 
 def list_order_transactions(order_ids: list[str]) -> list[dict]:
     script = f"""
 import json
 import msgspec
-from app import db
-from coordinator.models import CheckoutTxValue
+from orchestrator.app import db
+from orchestrator.models import CheckoutTxValue
 
 decoder = msgspec.msgpack.Decoder(CheckoutTxValue)
 target_order_ids = set({order_ids!r})
@@ -318,13 +328,13 @@ while True:
         break
 print(json.dumps(results))
 """.strip()
-    return json.loads(docker_exec_service_python("order-service", script))
+    return json.loads(docker_exec_service_python("orchestrator-service", script))
 
 
 def get_active_tx_guards(order_ids: list[str]) -> dict[str, str | None]:
     script = f"""
 import json
-from app import db
+from orchestrator.app import db
 
 order_ids = {order_ids!r}
 result = {{}}
@@ -333,7 +343,7 @@ for order_id in order_ids:
     result[order_id] = raw.decode() if raw is not None else None
 print(json.dumps(result))
 """.strip()
-    return json.loads(docker_exec_service_python("order-service", script))
+    return json.loads(docker_exec_service_python("orchestrator-service", script))
 
 
 class LiveStackTestCase(unittest.TestCase):

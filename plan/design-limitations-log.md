@@ -7,6 +7,101 @@ It should be updated whenever implementation reveals a new constraint, incorrect
 
 Use this log to avoid repeating known mistakes and to justify walking back earlier decisions when needed.
 
+## 2026-03-30 - Docker Compose RabbitMQ clustering helps connection spread and failover more than single-queue throughput
+
+- Limitation encountered:
+  - The Docker-only scale-out request needed larger RabbitMQ topologies, but this application still publishes to a fixed set of hot queues (`stock.commands`, `payment.commands`, `order.commands`, `orchestrator.commands`) plus per-process reply queues.
+
+- Why the current design caused it:
+  - Queue topology is hard-coded as one durable queue per command path, with no queue sharding and no dynamic service-discovery-aware gateway for easy container replica fan-out in plain Docker Compose.
+  - RabbitMQ clustering behind HAProxy spreads client connections and survives single-node loss, but one queue leader can still dominate one hot path.
+
+- Impact:
+  - Performance risk: adding RabbitMQ nodes in Docker Compose is useful, but it does not guarantee linear throughput gains for one saturated queue or one saturated participant path.
+
+- Chosen mitigation or follow-up action:
+  - Add Docker-only compose profiles that scale vertically inside each Python service container and use 3-node/5-node RabbitMQ clusters only for the medium/large profiles.
+  - Reserve explicit CPU sets for the stack so Locust can keep dedicated cores.
+  - If RabbitMQ remains the bottleneck after this, the next change should be queue sharding or multiple participant command queues instead of only adding more broker nodes.
+
+## 2026-03-20 - Internal RPC transport must not erase stable local outcomes or tie reply durability to one consumer connection
+
+- Limitation encountered:
+  - Phase 2 extraction routed every checkout through orchestrator RPC, including already-paid orders that the order service can answer locally and idempotently.
+  - Per-process RPC reply queues were declared as exclusive auto-delete queues, so a RabbitMQ connection drop deleted the queue and could lose in-flight replies for already-executed work.
+
+- Why the current design caused it:
+  - The extraction optimized for one orchestration path and treated transport uniformity as more important than preserving owner-local fast paths.
+  - Reply-queue lifecycle was coupled to one consumer connection instead of the process-level request/reply contract.
+
+- Impact:
+  - Reliability risk: already-paid checkout retries could return transport-driven `4xx` failures instead of stable `200` responses.
+  - Availability risk: reply-path reconnects could turn successful side effects into caller timeouts and false failures.
+
+- Chosen mitigation or follow-up action:
+  - Keep a local already-paid checkout short-circuit in `order-service` before orchestrator RPC.
+  - Use per-process reply queues that survive reconnects and expire later, instead of exclusive auto-delete queues.
+  - Keep the recovery leader lease longer than the scan interval so reconnect/recovery coordination remains conservative.
+
+## 2026-03-19 - Stable service-dir entrypoints still diverge from repo-root unit-test imports
+
+- Limitation encountered:
+  - Keeping each microservice runnable from its own copied service directory means local modules are imported by short names such as `store`, `runtime_service`, or `internal_handler`.
+  - Repo-root unit tests load those same files through custom module loaders, so service-local imports are not automatically resolvable there.
+
+- Why the current design caused it:
+  - Dockerfiles still copy each service into `/home/flask-app` as flat modules to preserve existing Gunicorn and Flask entrypoints.
+  - The cleanup pass intentionally avoided a package-layout rewrite, so imports could not be normalized around one package root without changing deployment assumptions.
+
+- Impact:
+  - Delivery risk: local test harnesses need explicit module injection for service-local helpers, or refactors fail in tests despite being valid in containers.
+  - Reliability risk: ad-hoc import fallbacks inside production modules become tempting and can leak environment-specific behavior into runtime code.
+
+- Chosen mitigation or follow-up action:
+  - Keep production modules using the service-dir import shape expected by the deployed containers.
+  - Extend local test loaders to inject service-local modules explicitly.
+  - Prefer runtime/handler dependency injection over importing Flask app symbols across modules so the remaining environment-specific wiring stays at startup boundaries.
+
+## 2026-03-19 - Extracting the orchestrator over internal HTTP preserved worker deadlocks and ambiguous side effects
+
+- Limitation encountered:
+  - Keeping public checkout in `order-service` while forwarding to the orchestrator over synchronous HTTP left each checkout request holding an order-service worker while the orchestrator called back into the same service to read orders and mark them paid.
+  - Retrying those non-idempotent HTTP calls on transport errors also made lost responses indistinguishable from failed side effects.
+
+- Why the current design caused it:
+  - The first extraction kept the Phase 1 coordination flow shape and only moved the coordinator process boundary.
+  - That preserved a request/response dependency cycle between `order-service` and `orchestrator` instead of making their internal coordination asynchronous and message-correlated.
+
+- Impact:
+  - Availability risk: checkout concurrency could saturate order-service workers and deadlock orchestrator callbacks.
+  - Consistency risk: a lost `mark_paid` or mutation-guard HTTP response could trigger false aborts, leaked guards, or other indeterminate outcomes.
+  - Delivery risk: docker-compose and Kubernetes configs drifted because the new internal HTTP dependencies were only partially wired.
+
+- Chosen mitigation or follow-up action:
+  - Keep the public API unchanged: `POST /orders/checkout/{order_id}` still enters `order-service`.
+  - Move all internal `order-service` <-> `orchestrator` coordination to RabbitMQ request/reply.
+  - Remove the internal HTTP `read_order`, `mark_paid`, and mutation-guard routes entirely.
+  - Keep only orchestrator-owned Redis guards, and make guard acquire/clear owner-safe and idempotent for same-owner retries.
+  - Provision RabbitMQ, orchestrator, and orchestrator Redis explicitly in both compose and Kubernetes while keeping the orchestrator internal-only.
+
+## 2026-03-19 - A read-only orchestrator lock check is not enough to serialize order mutation against checkout
+
+- Limitation encountered:
+  - After moving the active checkout guard into orchestrator-owned Redis, a simple order-service `GET locked?` call before `addItem` leaves a race window where checkout can start after the read but before the order mutation commits.
+
+- Why the current design caused it:
+  - In Phase 1, `addItem` and checkout both observed the same Redis guard key locally from the order service.
+  - In Phase 2, the authoritative guard moves to a different service and datastore, so a read-only remote check is no longer atomic with the order write.
+
+- Impact:
+  - Consistency risk: an item can be added after checkout begins but before the order is marked paid, creating a stale checkout snapshot or a free-item bug.
+
+- Chosen mitigation or follow-up action:
+  - Add an orchestrator-owned short-lived mutation guard in orchestrator Redis.
+  - `addItem` acquires/releases that guard via internal orchestrator endpoints.
+  - Checkout acquires the active-tx guard only when no mutation guard exists.
+  - This keeps tx coordination state out of order Redis while preserving mutual exclusion between checkout and order mutation.
+
 ## 2026-03-11 - Live-stack transaction verification needs out-of-band observability
 
 - Limitation encountered:

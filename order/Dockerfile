@@ -6,7 +6,6 @@ COPY order/requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY common/ ./common/
-COPY coordinator/ ./coordinator/
 COPY order/ .
 
 EXPOSE 5000

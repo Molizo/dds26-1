@@ -13,13 +13,14 @@ import os
 import redis
 
 from common.constants import CMD_HOLD, CMD_RELEASE, CMD_COMMIT, SVC_STOCK
-from common.messaging import publish_reply, start_participant_consumer
+from common.messaging import start_participant_consumer
 from common.models import (
     ParticipantCommand,
     ParticipantReply,
     decode_command,
     encode_reply,
 )
+from common.worker_support import handle_participant_delivery
 from common.constants import STOCK_COMMANDS_QUEUE
 import service as stock_service
 
@@ -44,31 +45,18 @@ def start_consumer_thread() -> None:
 
 
 def _handle_command(channel, method, properties, body: bytes) -> None:
-    """Process one ParticipantCommand message.
-
-    Always acks the message before returning so it is not requeued.
-    Errors in processing are reported via ParticipantReply(ok=False) rather
-    than nacking, which would cause infinite redelivery for logic errors.
-    """
-    try:
-        cmd: ParticipantCommand = decode_command(body)
-    except Exception as exc:
-        logger.error("Failed to decode stock command: %s", exc)
-        # Nack without requeue — malformed messages go to DLQ
-        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-        return
-
-    logger.info("stock cmd tx=%s command=%s", cmd.tx_id, cmd.command)
-    reply = _dispatch(cmd)
-    channel.basic_ack(delivery_tag=method.delivery_tag)
-
-    try:
-        publish_reply(_rabbitmq_url, cmd.reply_to, encode_reply(reply))
-    except Exception as exc:
-        # Reply publish failed; the coordinator will time out and mark
-        # FAILED_NEEDS_RECOVERY. Recovery will re-publish the command, and
-        # the Lua script's idempotency check will return the cached result.
-        logger.error("Failed to publish reply for tx=%s: %s", cmd.tx_id, exc)
+    """Process one ParticipantCommand message."""
+    handle_participant_delivery(
+        channel=channel,
+        method=method,
+        body=body,
+        rabbitmq_url=_rabbitmq_url,
+        service_name="stock",
+        decode_command=decode_command,
+        dispatch=_dispatch,
+        encode_reply=encode_reply,
+        logger=logger,
+    )
 
 
 def _dispatch(cmd: ParticipantCommand) -> ParticipantReply:

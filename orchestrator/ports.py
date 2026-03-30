@@ -10,26 +10,12 @@ duck typing is sufficient.
 """
 from typing import Optional, Protocol
 
-from coordinator.models import CheckoutTxValue
+from common.models import OrderSnapshot
+from orchestrator.models import CheckoutTxValue
 
 
-class OrderSnapshot:
-    """Lightweight snapshot of order state needed by the coordinator."""
-    __slots__ = ("order_id", "user_id", "total_cost", "paid", "items")
-
-    def __init__(
-        self,
-        order_id: str,
-        user_id: str,
-        total_cost: int,
-        paid: bool,
-        items: list[tuple[str, int]],
-    ):
-        self.order_id = order_id
-        self.user_id = user_id
-        self.total_cost = total_cost
-        self.paid = paid
-        self.items = items
+class OrderPortUnavailable(RuntimeError):
+    """Raised when the order service cannot confirm an RPC result."""
 
 
 class OrderPort(Protocol):
@@ -81,10 +67,24 @@ class TxStorePort(Protocol):
 
     def clear_active_tx_guard(self, order_id: str) -> None: ...
 
+    def clear_active_tx_guard_if_owned(self, order_id: str, tx_id: str) -> bool: ...
+
     def refresh_active_tx_guard(self, order_id: str, ttl: int) -> bool: ...
+
+    def acquire_mutation_guard(self, order_id: str, lease_id: str, ttl: int) -> bool: ...
+
+    def get_mutation_guard(self, order_id: str) -> Optional[str]: ...
+
+    def release_mutation_guard(self, order_id: str, lease_id: str) -> bool: ...
 
     # Optional but recommended: best-effort per-tx recovery lock to avoid
     # duplicate recovery across multiple scanner threads/processes.
     def acquire_recovery_lock(self, tx_id: str, ttl: int) -> bool: ...
 
     def release_recovery_lock(self, tx_id: str) -> None: ...
+
+    # Optional but recommended in Phase 2 when multiple orchestrator instances
+    # exist: only the current leader runs periodic recovery scans.
+    def acquire_recovery_leader(self, owner_id: str, ttl: int) -> bool: ...
+
+    def release_recovery_leader(self, owner_id: str) -> None: ...

@@ -7,6 +7,23 @@ It should be updated whenever implementation reveals a new constraint, incorrect
 
 Use this log to avoid repeating known mistakes and to justify walking back earlier decisions when needed.
 
+## 2026-03-30 - Docker Compose RabbitMQ clustering helps connection spread and failover more than single-queue throughput
+
+- Limitation encountered:
+  - The Docker-only scale-out request needed larger RabbitMQ topologies, but this application still publishes to a fixed set of hot queues (`stock.commands`, `payment.commands`, `order.commands`, `orchestrator.commands`) plus per-process reply queues.
+
+- Why the current design caused it:
+  - Queue topology is hard-coded as one durable queue per command path, with no queue sharding and no dynamic service-discovery-aware gateway for easy container replica fan-out in plain Docker Compose.
+  - RabbitMQ clustering behind HAProxy spreads client connections and survives single-node loss, but one queue leader can still dominate one hot path.
+
+- Impact:
+  - Performance risk: adding RabbitMQ nodes in Docker Compose is useful, but it does not guarantee linear throughput gains for one saturated queue or one saturated participant path.
+
+- Chosen mitigation or follow-up action:
+  - Add Docker-only compose profiles that scale vertically inside each Python service container and use 3-node/5-node RabbitMQ clusters only for the medium/large profiles.
+  - Reserve explicit CPU sets for the stack so Locust can keep dedicated cores.
+  - If RabbitMQ remains the bottleneck after this, the next change should be queue sharding or multiple participant command queues instead of only adding more broker nodes.
+
 ## 2026-03-20 - Internal RPC transport must not erase stable local outcomes or tie reply durability to one consumer connection
 
 - Limitation encountered:

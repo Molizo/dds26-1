@@ -35,6 +35,31 @@ After coding the REST endpoint logic run `docker-compose up --build` in the base
 
 ***Requirements:*** You need to have docker and docker-compose installed on your machine. 
 
+#### Docker-Only Scaling Profiles
+
+Three compose files are available for Docker-only benchmarking:
+
+- `docker-compose.yml`
+  - small profile with a single container per service and datastore
+- `docker-compose.medium.yml`
+  - medium-sized topology estimated from the 50-core target
+- `docker-compose.large.yml`
+  - large-sized topology estimated from the 90-core target
+
+Start one profile at a time:
+
+```powershell
+docker compose -f docker-compose.yml up --build -d
+docker compose -f docker-compose.medium.yml up --build -d
+docker compose -f docker-compose.large.yml up --build -d
+```
+
+Tear a profile down with:
+
+```powershell
+docker compose -f docker-compose.medium.yml down -v
+```
+
 K8s is also possible, but we do not require it as part of your submission. 
 
 #### minikube (local k8s cluster)

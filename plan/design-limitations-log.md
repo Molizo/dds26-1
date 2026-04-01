@@ -7,6 +7,26 @@ It should be updated whenever implementation reveals a new constraint, incorrect
 
 Use this log to avoid repeating known mistakes and to justify walking back earlier decisions when needed.
 
+## 2026-03-31 - Phase 1 Docker-only scaling profiles cannot reuse phase-2 orchestrator capacity unchanged
+
+- Limitation encountered:
+  - The medium and large Docker Compose profiles from `phase-2` cannot be copied directly onto `main` because phase 1 embeds checkout coordination inside `order-service` and does not have `orchestrator-service` or `orchestrator-db` containers.
+
+- Why the current design caused it:
+  - Phase 2 split coordinator work into dedicated orchestrator containers, so the phase-2 compose files assign part of the checkout capacity budget to those separate services.
+  - Phase 1 keeps that same coordination work inside `order-service`, so a straight file copy would both reference missing services and underprovision the order path.
+
+- Impact:
+  - Delivery risk: the copied profiles would fail to start on phase 1 because of orphaned orchestrator service references and env files.
+  - Performance risk: removing orchestrator replicas without replacing that capacity would bottleneck checkout on the busiest phase-1 service.
+
+- Chosen mitigation or follow-up action:
+  - Treat the existing `docker-compose.yml` as the small profile on phase 1.
+  - Port the shared Docker-only scaling assets and the medium/large RabbitMQ topologies from `phase-2`.
+  - Remove all orchestrator-specific containers and references.
+  - Keep the numbered RabbitMQ services and sequential join order from `phase-2`, but increase the broker healthcheck `start_period` to give the chained startup more time to settle on local Docker runs.
+  - Reassign the removed orchestrator replica budget to `order-service` 1:1 in the phase-1 medium and large profiles.
+
 ## 2026-03-11 - Live-stack transaction verification needs out-of-band observability
 
 - Limitation encountered:

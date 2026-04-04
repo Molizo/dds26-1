@@ -1,6 +1,6 @@
 ChatGPT Codex (5.3-codex, 5.4) & Claude (Opus 4.6, Sonnet) - Main debate partners and plan implementers
 
-Theodore (5701619, m.t.visoiu@student.tudelft.nl) - Oversaw AI during implementation, booked meeting rooms, some benchmarking
-Vuk (5513847, v.jurisic@tudelft.nl) - Stress tested system after every commit, helped with infra deployment and cross-platform testing
-Arnas (6427553, a.venskunas@student.tudelft.nl) - Stress tested system after every commit, helped with infra deployment and cross-platform testing
-Greta (6478875, g.slivinskaite@student.tudelft.nl)- Helped with edge case discovery and possible solutions. Scrutinized implementation plans
+Theodore Visoiu (5701619, m.t.visoiu@student.tudelft.nl) - Oversaw AI during implementation, booked meeting rooms, some benchmarking
+Vuk Jurišić (5513847, v.jurisic@tudelft.nl) - Stress tested system after every commit, helped with infra deployment and cross-platform testing
+Arnas Venskūnas (6427553, a.venskunas@student.tudelft.nl) - Stress tested system after every commit, helped with infra deployment and cross-platform testing
+Greta Slivinskaitė (6478875, g.slivinskaite@student.tudelft.nl)- Helped with edge case discovery and possible solutions. Scrutinized implementation plans
